@@ -77,6 +77,77 @@ async function fetchWithRetries(url, options, maxRetries = 3) {
     throw lastError || new Error('Failed to fetch after multiple attempts');
 }
 
+// Add a YouTube-specific fetch helper
+async function fetchFromYouTube(url, options, maxRetries = 3) {
+    // YouTube-specific error fix: Sometimes YouTube needs a proper referer and origin
+    const youtubeOptions = {
+        ...options,
+        headers: {
+            ...options.headers,
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com'
+        }
+    };
+
+    let lastError;
+    let retryDelay = 1000;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`YouTube fetch attempt ${attempt}/${maxRetries} for: ${url.substring(0, 60)}...`);
+            
+            // Check if URL has expired parameters
+            const urlObj = new URL(url);
+            if (urlObj.hostname.includes('googlevideo.com')) {
+                // Parse 'expire' parameter if it exists
+                const expire = urlObj.searchParams.get('expire');
+                if (expire) {
+                    const expireTimestamp = parseInt(expire, 10) * 1000; // Convert to milliseconds
+                    const currentTime = Date.now();
+                    
+                    if (expireTimestamp < currentTime) {
+                        console.error('URL has expired:', { 
+                            expired: new Date(expireTimestamp).toISOString(),
+                            now: new Date(currentTime).toISOString(),
+                            diff: Math.round((currentTime - expireTimestamp) / 1000 / 60) + ' minutes ago'
+                        });
+                        throw new Error('YouTube URL has expired. Request a fresh URL.');
+                    } else {
+                        // Log expiration time
+                        console.log(`URL will expire in ${Math.round((expireTimestamp - currentTime) / 1000 / 60)} minutes`);
+                    }
+                }
+            }
+            
+            const response = await fetch(url, youtubeOptions);
+            
+            if (response.status === 429) {
+                console.warn(`Rate limited by YouTube (429). Waiting ${retryDelay}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                retryDelay *= 2; // Exponential backoff
+                continue;
+            }
+            
+            if (!response.ok) {
+                throw new Error(`YouTube responded with ${response.status} ${response.statusText}`);
+            }
+            
+            return response;
+        } catch (err) {
+            lastError = err;
+            console.error(`YouTube fetch attempt ${attempt} failed:`, err.message);
+            
+            if (attempt < maxRetries) {
+                console.log(`Waiting ${retryDelay}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                retryDelay *= 2; // Exponential backoff
+            }
+        }
+    }
+    
+    throw lastError || new Error('Failed to fetch from YouTube after multiple attempts');
+}
+
 app.get('/proxy', async (req, res) => {
     const videoUrl = req.query.url;
     const userAgent = req.headers['user-agent'] || 'Mozilla/5.0';
@@ -85,11 +156,20 @@ app.get('/proxy', async (req, res) => {
         return res.status(400).json({ error: 'Missing url parameter' });
     }
 
-    console.log(`Processing request for: ${videoUrl.substring(0, 100)}...`);
+    // Add request ID for tracking
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    console.log(`[${requestId}] Processing request for: ${videoUrl.substring(0, 100)}...`);
 
     try {
+        // Check if it's a YouTube URL
+        const isYouTubeUrl = videoUrl.includes('googlevideo.com') || 
+                             videoUrl.includes('youtube.com') || 
+                             videoUrl.includes('youtu.be');
+        
+        console.log(`[${requestId}] URL identified as ${isYouTubeUrl ? 'YouTube' : 'generic'} URL`);
+        
         // Log more details about the request
-        console.log(`Request headers:`, JSON.stringify(req.headers, null, 2));
+        console.log(`[${requestId}] Request headers:`, JSON.stringify(req.headers, null, 2));
         
         const fetchOptions = {
             headers: {
@@ -102,19 +182,16 @@ app.get('/proxy', async (req, res) => {
             }
         };
         
-        console.log(`Fetch options:`, JSON.stringify(fetchOptions, null, 2));
+        console.log(`[${requestId}] Fetch options:`, JSON.stringify(fetchOptions, null, 2));
         
-        // Use our enhanced fetch with retries
-        const response = await fetchWithRetries(videoUrl, fetchOptions);
-
-        if (!response.ok) {
-            console.error(`Error response: ${response.status} ${response.statusText}`);
-            return res.status(response.status).json({ error: `Failed to fetch: ${response.statusText}` });
-        }
+        // Use YouTube-specific fetch for YouTube URLs, regular fetch otherwise
+        const response = isYouTubeUrl
+            ? await fetchFromYouTube(videoUrl, fetchOptions)
+            : await fetchWithRetries(videoUrl, fetchOptions);
 
         // Log response details before piping
-        console.log(`Response status: ${response.status}`);
-        console.log(`Response headers:`, JSON.stringify(Object.fromEntries([...response.headers.entries()]), null, 2));
+        console.log(`[${requestId}] Response status: ${response.status}`);
+        console.log(`[${requestId}] Response headers:`, JSON.stringify(Object.fromEntries([...response.headers.entries()]), null, 2));
 
         // Copy all response headers to our response
         for (const [key, value] of response.headers.entries()) {
@@ -165,7 +242,7 @@ app.get('/proxy', async (req, res) => {
             const urlPreview = videoUrl.length > 60 ? 
                 `${videoUrl.substring(0, 30)}...${videoUrl.substring(videoUrl.length - 30)}` : 
                 videoUrl;
-            console.log(`Successfully piping response for: ${urlPreview}`);
+            console.log(`[${requestId}] Successfully piping response for: ${urlPreview}`);
         } catch (streamSetupErr) {
             console.error('Error setting up stream:', streamSetupErr);
             // Only send error if headers have not been sent
@@ -175,27 +252,52 @@ app.get('/proxy', async (req, res) => {
         }
         
     } catch (err) {
-        console.error('Proxy error:', err);
-        console.error('Error stack:', err.stack);
+        console.error(`[${requestId}] Proxy error:`, err);
+        console.error(`[${requestId}] Error stack:`, err.stack);
+        
+        // Provide detailed error information
+        const errorDetails = {
+            message: err.message,
+            type: err.name || 'Unknown',
+            code: err.code || 'None',
+            timestamp: new Date().toISOString()
+        };
+        
+        // Check for YouTube-specific errors
+        if (err.message.includes('URL has expired')) {
+            return res.status(410).json({
+                error: 'YouTube URL has expired',
+                details: errorDetails,
+                solution: 'Please refresh the page and try again to get a fresh URL'
+            });
+        }
         
         // Send appropriate error based on the error type
         if (err.code === 'ENOTFOUND') {
-            return res.status(404).json({ error: 'Resource not found or host unreachable' });
+            return res.status(404).json({ 
+                error: 'Resource not found or host unreachable',
+                details: errorDetails
+            });
         } else if (err.type === 'request-timeout' || err.name === 'AbortError') {
-            return res.status(504).json({ error: 'Request timeout' });
+            return res.status(504).json({ 
+                error: 'Request timeout',
+                details: errorDetails
+            });
         } else if (err.message.includes('429')) {
             return res.status(429).json({ 
                 error: 'Too Many Requests from source API',
-                retryAfter: 60 // Suggest retry after 1 minute
+                retryAfter: 60, // Suggest retry after 1 minute
+                details: errorDetails
             });
         } else if (err.message.includes('403')) {
             return res.status(403).json({ 
                 error: 'Resource access forbidden (403)',
-                details: err.message
+                details: errorDetails,
+                solution: 'Try using a different video format or quality'
             });
         } else {
             // Log as much detail as possible about the error
-            console.error('Unhandled error details:', {
+            console.error('[${requestId}] Unhandled error details:', {
                 message: err.message,
                 name: err.name,
                 code: err.code,
@@ -206,7 +308,9 @@ app.get('/proxy', async (req, res) => {
             res.status(500).json({ 
                 error: `Proxy server error: ${err.message}`,
                 errorType: err.name || 'Unknown',
-                errorCode: err.code || 'None'
+                errorCode: err.code || 'None',
+                timestamp: new Date().toISOString(),
+                solution: 'Try refreshing the page to get a fresh URL or try a different video'
             });
         }
     }
