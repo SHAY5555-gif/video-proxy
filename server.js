@@ -7,6 +7,10 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
+// Import required modules for FormData and Blob in Node.js
+const FormData = require('form-data');
+const { Blob } = require('buffer');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -702,55 +706,7 @@ app.get('/download', async (req, res) => {
             throw new Error('תגובה לא תקפה מנקודת הקצה של מידע הסרטון');
         }
         
-        // Function to validate a download URL before redirecting
-        const validateDownloadUrl = async (url, description) => {
-            try {
-                console.log(`[${requestId}] Validating download URL for ${description}...`);
-                
-                // Create options for HEAD request to validate URL
-                const options = {
-                    method: 'HEAD',
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0',
-                        'Accept': '*/*',
-                        'Accept-Encoding': 'identity',
-                        'Connection': 'keep-alive',
-                        'Referer': 'https://www.youtube.com/'
-                    },
-                    timeout: 5000 // 5 second timeout for validation
-                };
-                
-                // For YouTube URLs, use our specialized fetch
-                const isYouTubeUrl = url.includes('googlevideo.com') || 
-                                    url.includes('youtube.com') || 
-                                    url.includes('youtu.be');
-                
-                // Try a HEAD request first for efficiency
-                const response = isYouTubeUrl 
-                    ? await fetchFromYouTube(url, options, 1) // Only one attempt for validation
-                    : await fetchWithRetries(url, options, 1);
-                
-                if (response.status >= 200 && response.status < 300) {
-                    console.log(`[${requestId}] URL validation successful for ${description}`);
-                    return { valid: true };
-                } else {
-                    console.warn(`[${requestId}] URL validation failed with status ${response.status} for ${description}`);
-                    return { 
-                        valid: false, 
-                        status: response.status,
-                        reason: `Invalid response status: ${response.status}`
-                    };
-                }
-            } catch (error) {
-                console.error(`[${requestId}] URL validation error for ${description}:`, error.message);
-                return { 
-                    valid: false, 
-                    reason: error.message
-                };
-            }
-        };
-        
-        // Try to find a working format with fallbacks
+        // Try to find a working format with fallbacks - simplified approach without validation
         let downloadUrl;
         let filename;
         let size = 'unknown';
@@ -761,8 +717,8 @@ app.get('/download', async (req, res) => {
         // Track all attempts to report to user
         const attemptedFormats = [];
         
-        // Attempt to get URL for the requested format
-        const tryFormat = async (formatType, formatIndex = 0) => {
+        // Attempt to get URL for the requested format - simplified
+        const tryFormat = (formatType, formatIndex = 0) => {
             const desc = formatType + (formatIndex > 0 ? ` (alternative ${formatIndex})` : '');
             attemptedFormats.push(desc);
             
@@ -787,14 +743,12 @@ app.get('/download', async (req, res) => {
             // Try alternative formats from the formats array
             else {
                 if (formatType === 'audio' && infoData.data.formats && infoData.data.formats.audio) {
-                    // Skip the first one which is the recommended one we already tried
                     const alternativeIndex = formatIndex - 1;
                     if (alternativeIndex < infoData.data.formats.audio.length) {
                         fmtInfo = infoData.data.formats.audio[alternativeIndex];
                         url = fmtInfo.url;
                     }
                 } else if (formatType === 'video' && infoData.data.formats && infoData.data.formats.video) {
-                    // Skip the first one which is the recommended one we already tried
                     const alternativeIndex = formatIndex - 1;
                     if (alternativeIndex < infoData.data.formats.video.length) {
                         fmtInfo = infoData.data.formats.video[alternativeIndex];
@@ -808,22 +762,15 @@ app.get('/download', async (req, res) => {
                 return null;
             }
             
-            // Validate the URL before returning it
-            const validation = await validateDownloadUrl(url, desc);
-            if (validation.valid) {
-                return {
-                    url,
-                    formatInfo: fmtInfo,
-                    description: desc
-                };
-            }
-            
-            console.warn(`[${requestId}] Format ${desc} URL is invalid: ${validation.reason}`);
-            return null;
+            return {
+                url,
+                formatInfo: fmtInfo,
+                description: desc
+            };
         };
         
         // First try the explicitly requested format
-        let result = await tryFormat(format);
+        let result = tryFormat(format);
         
         // If the primary format fails, try alternatives
         if (!result) {
@@ -833,11 +780,11 @@ app.get('/download', async (req, res) => {
             // If the requested format is 'combined', try 'video' then 'audio'
             if (format === 'combined') {
                 fallbackMessage += 'מנסה פורמט וידאו...';
-                result = await tryFormat('video');
+                result = tryFormat('video');
                 
                 if (!result) {
                     fallbackMessage += ' מנסה פורמט אודיו בלבד...';
-                    result = await tryFormat('audio');
+                    result = tryFormat('audio');
                 }
             } 
             // If requested format is 'video', try alternatives from the formats.video array
@@ -847,17 +794,17 @@ app.get('/download', async (req, res) => {
                 
                 for (let i = 1; i <= Math.min(videoFormatCount, 3) && !result; i++) {
                     fallbackMessage += ` מנסה פורמט וידאו חלופי ${i}...`;
-                    result = await tryFormat('video', i);
+                    result = tryFormat('video', i);
                 }
                 
                 // If all video formats fail, try combined then audio
                 if (!result) {
                     fallbackMessage += ' מנסה פורמט משולב...';
-                    result = await tryFormat('combined');
+                    result = tryFormat('combined');
                     
                     if (!result) {
                         fallbackMessage += ' מנסה פורמט אודיו בלבד...';
-                        result = await tryFormat('audio');
+                        result = tryFormat('audio');
                     }
                 }
             }
@@ -868,17 +815,17 @@ app.get('/download', async (req, res) => {
                 
                 for (let i = 1; i <= Math.min(audioFormatCount, 3) && !result; i++) {
                     fallbackMessage += ` מנסה פורמט אודיו חלופי ${i}...`;
-                    result = await tryFormat('audio', i);
+                    result = tryFormat('audio', i);
                 }
                 
                 // If all audio formats fail, try combined then video
                 if (!result) {
                     fallbackMessage += ' מנסה פורמט משולב...';
-                    result = await tryFormat('combined');
+                    result = tryFormat('combined');
                     
                     if (!result) {
                         fallbackMessage += ' מנסה פורמט וידאו...';
-                        result = await tryFormat('video');
+                        result = tryFormat('video');
                     }
                 }
             }
@@ -957,7 +904,7 @@ app.get('/download', async (req, res) => {
         const htmlResponse = fallbackMessage ? `
             <html>
                 <head>
-                    <title>הורדה מתחילה בעוד 3 שניות...</title>
+                    <title>הורדה בפורמט חלופי</title>
                     <meta charset="UTF-8">
                     <meta http-equiv="refresh" content="3;url=${downloadUrl}">
                     <style>
@@ -2206,21 +2153,24 @@ app.get('/transcribe', async (req, res) => {
         // Step 4: Send the audio file to ElevenLabs for transcription
         console.log(`[${requestId}] Sending audio to ElevenLabs for transcription...`);
         
+        // Use the Node.js version of FormData
         const formData = new FormData();
-        const audioFileBuffer = fs.readFileSync(tempAudioPath);
-        const audioBlob = new Blob([audioFileBuffer]);
-        
-        formData.append('file', audioBlob, `${resolvedVideoId}.mp3`);
+        // Add the file as a stream instead of using Blob
+        formData.append('file', fs.createReadStream(tempAudioPath), {
+            filename: `${resolvedVideoId}.mp3`,
+            contentType: 'audio/mpeg'
+        });
         formData.append('model_id', 'scribe_v1');
         formData.append('timestamps_granularity', 'word');
         formData.append('language', ''); // Auto-detect language
         
         const elevenLabsUrl = 'https://api.elevenlabs.io/v1/speech-to-text';
+        const formHeaders = formData.getHeaders();
+        formHeaders['xi-api-key'] = ELEVENLABS_API_KEY;
+        
         const elevenLabsOptions = {
             method: 'POST',
-            headers: { 
-                'xi-api-key': ELEVENLABS_API_KEY
-            },
+            headers: formHeaders,
             body: formData
         };
         
