@@ -640,70 +640,139 @@ app.get('/youtube-info', async (req, res) => {
     }
 });
 
-// Add a direct download endpoint that uses the ZM data
+// Improve the download endpoint with better error handling
 app.get('/download', async (req, res) => {
     const videoId = req.query.id;
     const format = req.query.format || 'combined'; // 'video', 'audio', or 'combined'
     const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
     
     if (!videoId) {
-        return res.status(400).json({ error: 'Missing required parameter: id' });
+        return res.status(400).json({ 
+            success: false,
+            error: 'חסר פרמטר חובה: id (מזהה סרטון)',
+            example: '/download?id=YOUTUBE_VIDEO_ID&format=audio|video|combined'
+        });
     }
     
     try {
         console.log(`[${requestId}] Download request for video ID: ${videoId}, format: ${format}`);
         
         // First fetch the video info using our own API
-        const infoUrl = `https://${req.headers.host}/youtube-info?id=${videoId}`;
+        const infoUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/youtube-info?id=${videoId}`;
+        console.log(`[${requestId}] Fetching video info from: ${infoUrl}`);
+        
         const infoResponse = await fetch(infoUrl);
         
         if (!infoResponse.ok) {
-            let errorText = await infoResponse.text();
-            throw new Error(`Failed to get video info: ${errorText}`);
+            const errorText = await infoResponse.text();
+            console.error(`[${requestId}] Error fetching video info: ${infoResponse.status} ${errorText}`);
+            throw new Error(`שגיאה בקבלת מידע על הסרטון: ${infoResponse.status}. ${errorText}`);
         }
         
         const infoData = await infoResponse.json();
         
         if (!infoData.success || !infoData.data) {
-            throw new Error('Invalid response from youtube-info endpoint');
+            console.error(`[${requestId}] Invalid response from youtube-info:`, infoData);
+            throw new Error('תגובה לא תקפה מנקודת הקצה של מידע הסרטון');
         }
         
         // Select the appropriate format
         let downloadUrl;
         let filename;
+        let size = 'unknown';
+        let qualityInfo = '';
         
         if (format === 'audio') {
-            if (infoData.data.recommended.audio && infoData.data.recommended.audio.url) {
+            if (infoData.data.recommended && infoData.data.recommended.audio && infoData.data.recommended.audio.url) {
                 downloadUrl = infoData.data.recommended.audio.url;
                 const ext = infoData.data.recommended.audio.ext || 'mp3';
                 filename = `${infoData.data.title || videoId}_audio.${ext}`;
+                
+                if (infoData.data.recommended.audio.size) {
+                    size = formatFileSize(infoData.data.recommended.audio.size);
+                }
+                if (infoData.data.recommended.audio.quality) {
+                    qualityInfo = infoData.data.recommended.audio.quality;
+                }
             } else {
-                throw new Error('No audio format available');
+                console.error(`[${requestId}] No audio format available in data:`, infoData);
+                throw new Error('לא נמצא פורמט אודיו זמין לסרטון זה');
             }
         } else if (format === 'video') {
-            if (infoData.data.recommended.video && infoData.data.recommended.video.url) {
+            if (infoData.data.recommended && infoData.data.recommended.video && infoData.data.recommended.video.url) {
                 downloadUrl = infoData.data.recommended.video.url;
                 const ext = infoData.data.recommended.video.ext || 'mp4';
                 filename = `${infoData.data.title || videoId}_video.${ext}`;
+                
+                if (infoData.data.recommended.video.size) {
+                    size = formatFileSize(infoData.data.recommended.video.size);
+                }
+                if (infoData.data.recommended.video.quality) {
+                    qualityInfo = infoData.data.recommended.video.quality;
+                }
             } else {
-                throw new Error('No video format available');
+                console.error(`[${requestId}] No video format available in data:`, infoData);
+                throw new Error('לא נמצא פורמט וידאו זמין לסרטון זה');
             }
         } else { // combined
-            if (infoData.data.recommended.combined && infoData.data.recommended.combined.url) {
+            if (infoData.data.recommended && infoData.data.recommended.combined && infoData.data.recommended.combined.url) {
                 downloadUrl = infoData.data.recommended.combined.url;
                 const ext = infoData.data.recommended.combined.ext || 'mp4';
                 filename = `${infoData.data.title || videoId}.${ext}`;
+                
+                if (infoData.data.recommended.combined.size) {
+                    size = formatFileSize(infoData.data.recommended.combined.size);
+                }
+                if (infoData.data.recommended.combined.quality) {
+                    qualityInfo = infoData.data.recommended.combined.quality;
+                }
             } else {
-                throw new Error('No combined format available');
+                console.error(`[${requestId}] No combined format available in data:`, infoData);
+                throw new Error('לא נמצא פורמט משולב זמין לסרטון זה');
             }
         }
         
         if (!downloadUrl) {
-            throw new Error('Could not find a suitable download URL');
+            console.error(`[${requestId}] Could not find a suitable download URL for format: ${format}`);
+            throw new Error(`לא נמצאה כתובת הורדה מתאימה עבור הפורמט: ${format}`);
+        }
+        
+        // Check if URL might be expired
+        if (downloadUrl.includes('expire=')) {
+            try {
+                const urlObj = new URL(downloadUrl);
+                const expire = urlObj.searchParams.get('expire');
+                
+                if (expire) {
+                    const expireTimestamp = parseInt(expire, 10) * 1000; // Convert to milliseconds
+                    const currentTime = Date.now();
+                    
+                    if (expireTimestamp < currentTime) {
+                        console.error(`[${requestId}] YouTube URL has expired at ${new Date(expireTimestamp).toISOString()} (${Math.round((currentTime - expireTimestamp) / 1000 / 60)} minutes ago)`);
+                        throw new Error('כתובת ההורדה פגת תוקף. אנא רענן את הדף ונסה שוב');
+                    }
+                }
+            } catch (urlError) {
+                if (urlError.message.includes('כתובת ההורדה פגת תוקף')) {
+                    throw urlError; // Re-throw our custom error
+                }
+                // Otherwise continue with the download attempt
+            }
         }
         
         // Clean filename
         filename = filename.replace(/[<>:"/\\|?*]+/g, '_');
+        
+        // Log download details
+        console.log(`[${requestId}] Download details:
+            Title: ${infoData.data.title || 'Unknown'}
+            Format: ${format}
+            Filename: ${filename}
+            Size: ${size}
+            Quality: ${qualityInfo}
+            URL length: ${downloadUrl.length} chars
+            Expires: ${downloadUrl.includes('expire=') ? 'Yes (YouTube time-limited URL)' : 'No'}
+        `);
         
         // Set headers for file download
         res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
@@ -715,58 +784,491 @@ app.get('/download', async (req, res) => {
         
     } catch (error) {
         console.error(`[${requestId}] Download error:`, error);
-        res.status(500).json({
-            success: false,
-            error: `Download failed: ${error.message}`
-        });
+        
+        // Return a user-friendly HTML error page
+        res.status(500).send(`
+            <html>
+                <head>
+                    <title>שגיאת הורדה</title>
+                    <meta charset="UTF-8">
+                    <style>
+                        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: #f0f0f0; text-align: right; direction: rtl; }
+                        .container { max-width: 600px; margin: 100px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                        h1 { color: #c00; margin-top: 0; }
+                        .back-btn { display: inline-block; margin-top: 20px; padding: 10px 20px; background: #c00; color: white; text-decoration: none; border-radius: 4px; }
+                        .back-btn:hover { background: #900; }
+                        .error-details { background: #ffe6e6; padding: 15px; border-radius: 4px; margin-top: 20px; }
+                        code { background: #f8f8f8; padding: 2px 5px; border-radius: 3px; font-family: monospace; direction: ltr; display: inline-block; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>שגיאה בהורדת הסרטון</h1>
+                        <p>${error.message || 'שגיאה לא ידועה התרחשה בעת ניסיון להוריד את הסרטון'}</p>
+                        
+                        <div class="error-details">
+                            <p><strong>מזהה סרטון:</strong> <code>${videoId}</code></p>
+                            <p><strong>פורמט שנבחר:</strong> ${format}</p>
+                            <p><strong>מזהה בקשה:</strong> <code>${requestId}</code></p>
+                            <p><strong>זמן השגיאה:</strong> ${new Date().toLocaleString('he-IL')}</p>
+                        </div>
+                        
+                        <a href="/" class="back-btn">חזרה לדף הראשי</a>
+                    </div>
+                </body>
+            </html>
+        `);
     }
 });
 
-// Update landing page to include info about new endpoints
+// Helper function to format file size
+function formatFileSize(bytes) {
+    if (!bytes || isNaN(bytes)) return 'Unknown';
+    
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    if (bytes === 0) return '0 Bytes';
+    
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    if (i === 0) return bytes + ' ' + sizes[i];
+    
+    return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + sizes[i];
+}
+
+// Update landing page to include a user-friendly form
 app.get('/', (req, res) => {
     res.send(`
-        <html>
+        <!DOCTYPE html>
+        <html lang="en">
             <head>
-                <title>Video Proxy Server</title>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>YouTube Downloader</title>
                 <style>
-                    body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
-                    h1 { color: #333; }
-                    h2 { margin-top: 30px; }
-                    .container { max-width: 800px; margin: 0 auto; }
-                    code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-                    .note { background: #fff8dc; padding: 10px; border-left: 4px solid #ffeb3b; }
-                    .endpoint { margin-bottom: 20px; background: #f8f9fa; padding: 15px; border-radius: 4px; }
-                    .method { font-weight: bold; color: #4285f4; }
+                    :root {
+                        --primary-color: #c00;
+                        --secondary-color: #222;
+                        --accent-color: #f1f1f1;
+                        --text-color: #333;
+                        --light-text: #fff;
+                        --border-radius: 6px;
+                    }
+                    
+                    body {
+                        font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+                        margin: 0;
+                        padding: 0;
+                        background-color: #f9f9f9;
+                        color: var(--text-color);
+                        line-height: 1.6;
+                    }
+                    
+                    .header {
+                        background-color: var(--primary-color);
+                        color: var(--light-text);
+                        text-align: center;
+                        padding: 2rem 1rem;
+                        margin-bottom: 2rem;
+                    }
+                    
+                    .header h1 {
+                        margin: 0;
+                        font-size: 2.5rem;
+                    }
+                    
+                    .container {
+                        max-width: 800px;
+                        margin: 0 auto;
+                        padding: 0 1rem;
+                    }
+                    
+                    .download-card {
+                        background-color: white;
+                        border-radius: var(--border-radius);
+                        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+                        padding: 2rem;
+                        margin-bottom: 2rem;
+                    }
+                    
+                    .form-group {
+                        margin-bottom: 1.5rem;
+                    }
+                    
+                    label {
+                        display: block;
+                        margin-bottom: 0.5rem;
+                        font-weight: 600;
+                    }
+                    
+                    .input-url {
+                        width: 100%;
+                        padding: 0.75rem;
+                        border: 1px solid #ddd;
+                        border-radius: var(--border-radius);
+                        font-size: 1rem;
+                        direction: ltr;
+                    }
+                    
+                    .radio-group {
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 1rem;
+                        margin-top: 0.5rem;
+                    }
+                    
+                    .radio-option {
+                        display: flex;
+                        align-items: center;
+                        background-color: var(--accent-color);
+                        padding: 0.75rem 1rem;
+                        border-radius: var(--border-radius);
+                        cursor: pointer;
+                        transition: background-color 0.2s;
+                    }
+                    
+                    .radio-option:hover {
+                        background-color: #e5e5e5;
+                    }
+                    
+                    .radio-option input {
+                        margin-right: 0.5rem;
+                    }
+                    
+                    .submit-btn {
+                        background-color: var(--primary-color);
+                        color: white;
+                        border: none;
+                        padding: 0.75rem 2rem;
+                        font-size: 1rem;
+                        border-radius: var(--border-radius);
+                        cursor: pointer;
+                        transition: background-color 0.2s;
+                        display: inline-block;
+                        text-decoration: none;
+                        text-align: center;
+                    }
+                    
+                    .submit-btn:hover {
+                        background-color: #900;
+                    }
+                    
+                    .endpoints {
+                        margin-top: 3rem;
+                    }
+                    
+                    .endpoint {
+                        background-color: white;
+                        border-radius: var(--border-radius);
+                        padding: 1.5rem;
+                        margin-bottom: 1rem;
+                        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+                    }
+                    
+                    .method {
+                        color: var(--primary-color);
+                        font-weight: bold;
+                        margin-right: 0.5rem;
+                    }
+                    
+                    code {
+                        background-color: var(--accent-color);
+                        padding: 0.2rem 0.4rem;
+                        border-radius: 3px;
+                        font-family: 'Courier New', monospace;
+                    }
+                    
+                    .note {
+                        background-color: #feffdc;
+                        border-left: 4px solid #ffeb3b;
+                        padding: 1rem;
+                        margin-top: 2rem;
+                    }
+                    
+                    .preview {
+                        display: none;
+                        margin-top: 1.5rem;
+                        border-top: 1px solid #eee;
+                        padding-top: 1.5rem;
+                    }
+                    
+                    .preview.active {
+                        display: block;
+                    }
+                    
+                    .video-info {
+                        display: flex;
+                        gap: 1rem;
+                        margin-bottom: 1rem;
+                    }
+                    
+                    .thumbnail {
+                        width: 120px;
+                        min-width: 120px;
+                        border-radius: var(--border-radius);
+                    }
+                    
+                    .error-message {
+                        color: var(--primary-color);
+                        background-color: rgba(255, 0, 0, 0.1);
+                        padding: 1rem;
+                        border-radius: var(--border-radius);
+                        margin-top: 1rem;
+                        display: none;
+                    }
+                    
+                    .loading {
+                        text-align: center;
+                        padding: 2rem;
+                        display: none;
+                    }
+                    
+                    .spinner {
+                        border: 4px solid rgba(0, 0, 0, 0.1);
+                        border-radius: 50%;
+                        border-top: 4px solid var(--primary-color);
+                        width: 40px;
+                        height: 40px;
+                        animation: spin 1s linear infinite;
+                        margin: 0 auto 1rem;
+                    }
+                    
+                    @keyframes spin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                    
+                    /* Responsive adjustments */
+                    @media (max-width: 600px) {
+                        .header h1 {
+                            font-size: 2rem;
+                        }
+                        
+                        .radio-group {
+                            flex-direction: column;
+                            gap: 0.5rem;
+                        }
+                    }
                 </style>
             </head>
             <body>
+                <div class="header">
+                    <h1>YouTube Downloader</h1>
+                </div>
+                
                 <div class="container">
-                    <h1>Video Proxy Server</h1>
-                    <p>This proxy server is running and ready to handle requests.</p>
-                    
-                    <h2>Endpoints:</h2>
-                    
-                    <div class="endpoint">
-                        <p><span class="method">GET</span> <code>/proxy?url=YOUR_VIDEO_URL</code></p>
-                        <p>General-purpose proxy for fetching any URL (including media files).</p>
+                    <div class="download-card">
+                        <form id="download-form" action="/process" method="GET">
+                            <div class="form-group">
+                                <label for="url">הדבק כתובת סרטון YouTube:</label>
+                                <input type="text" id="url" name="url" class="input-url" 
+                                    placeholder="https://www.youtube.com/watch?v=..." required 
+                                    dir="ltr">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>בחר פורמט להורדה:</label>
+                                <div class="radio-group">
+                                    <label class="radio-option">
+                                        <input type="radio" name="format" value="audio" checked>
+                                        אודיו בלבד (MP3)
+                                    </label>
+                                    <label class="radio-option">
+                                        <input type="radio" name="format" value="video">
+                                        וידאו איכות גבוהה (MP4)
+                                    </label>
+                                    <label class="radio-option">
+                                        <input type="radio" name="format" value="combined">
+                                        וידאו + אודיו (MP4)
+                                    </label>
+                                </div>
+                            </div>
+                            
+                            <button type="submit" class="submit-btn">הורד עכשיו</button>
+                        </form>
+                        
+                        <div class="error-message" id="error-box"></div>
+                        
+                        <div class="loading" id="loading">
+                            <div class="spinner"></div>
+                            <p>מאתר פורמטים זמינים...</p>
+                        </div>
+                        
+                        <div class="preview" id="preview">
+                            <h3>פרטי הסרטון:</h3>
+                            <div class="video-info">
+                                <img id="thumbnail" class="thumbnail" src="" alt="תמונה ממוזערת">
+                                <div>
+                                    <h4 id="video-title"></h4>
+                                    <p id="video-duration"></p>
+                                </div>
+                            </div>
+                            <a id="download-btn" class="submit-btn">התחל הורדה</a>
+                        </div>
                     </div>
                     
-                    <div class="endpoint">
-                        <p><span class="method">GET</span> <code>/youtube-info?id=YOUTUBE_VIDEO_ID</code></p>
-                        <p>Fetches available video/audio formats for a YouTube video using ZM API.</p>
-                        <p>You can also use <code>/youtube-info?url=https://www.youtube.com/watch?v=VIDEOID</code></p>
-                    </div>
-                    
-                    <div class="endpoint">
-                        <p><span class="method">GET</span> <code>/download?id=YOUTUBE_VIDEO_ID&format=audio|video|combined</code></p>
-                        <p>Download YouTube video in specific format. Defaults to 'combined' if format not specified.</p>
+                    <div class="endpoints">
+                        <h2>ממשקי API זמינים:</h2>
+                        
+                        <div class="endpoint">
+                            <span class="method">GET</span>
+                            <code>/youtube-info?id=YOUTUBE_VIDEO_ID</code>
+                            <p>מחזיר פרטים על כל הפורמטים הזמינים לסרטון YouTube.</p>
+                        </div>
+                        
+                        <div class="endpoint">
+                            <span class="method">GET</span>
+                            <code>/download?id=YOUTUBE_VIDEO_ID&format=audio|video|combined</code>
+                            <p>מוריד סרטון YouTube בפורמט הנבחר.</p>
+                        </div>
+                        
+                        <div class="endpoint">
+                            <span class="method">GET</span>
+                            <code>/proxy?url=URL</code>
+                            <p>פרוקסי כללי להורדת קבצים.</p>
+                        </div>
                     </div>
                     
                     <div class="note">
-                        <p><strong>Note:</strong> Rate limiting is enabled. Maximum ${RATE_LIMIT_MAX} requests per IP address per ${RATE_LIMIT_WINDOW/1000} seconds.</p>
-                        <p>This server is intended for educational purposes only.</p>
+                        <p><strong>הערה:</strong> הגבלת קצב בתוקף. מקסימום ${RATE_LIMIT_MAX} בקשות לכל כתובת IP בכל ${RATE_LIMIT_WINDOW/1000} שניות.</p>
+                        <p>שרת זה נועד למטרות לימודיות בלבד.</p>
                     </div>
                 </div>
+                
+                <script>
+                    document.addEventListener('DOMContentLoaded', function() {
+                        const form = document.getElementById('download-form');
+                        const urlInput = document.getElementById('url');
+                        const errorBox = document.getElementById('error-box');
+                        const loading = document.getElementById('loading');
+                        const preview = document.getElementById('preview');
+                        const thumbnail = document.getElementById('thumbnail');
+                        const videoTitle = document.getElementById('video-title');
+                        const videoDuration = document.getElementById('video-duration');
+                        const downloadBtn = document.getElementById('download-btn');
+                        
+                        form.addEventListener('submit', async function(e) {
+                            e.preventDefault();
+                            
+                            // Hide any previous errors and preview
+                            errorBox.style.display = 'none';
+                            preview.classList.remove('active');
+                            
+                            const url = urlInput.value.trim();
+                            if (!url) {
+                                showError('נא להזין כתובת YouTube תקפה');
+                                return;
+                            }
+                            
+                            // Extract video ID from URL
+                            let videoId;
+                            try {
+                                videoId = extractVideoId(url);
+                            } catch (error) {
+                                showError(error.message);
+                                return;
+                            }
+                            
+                            if (!videoId) {
+                                showError('לא ניתן לחלץ את מזהה הסרטון מהכתובת. נא לוודא שזוהי כתובת YouTube תקפה.');
+                                return;
+                            }
+                            
+                            // Show loading indicator
+                            loading.style.display = 'block';
+                            
+                            try {
+                                // Get video info
+                                const response = await fetch(\`/youtube-info?id=\${videoId}\`);
+                                if (!response.ok) {
+                                    throw new Error(\`שגיאה בקבלת מידע על הסרטון: \${response.status} \${response.statusText}\`);
+                                }
+                                
+                                const data = await response.json();
+                                if (!data.success) {
+                                    throw new Error(data.error || 'שגיאה לא ידועה בקבלת מידע על הסרטון');
+                                }
+                                
+                                // Hide loading and show preview
+                                loading.style.display = 'none';
+                                
+                                // Update preview with video info
+                                thumbnail.src = data.data.thumbnail || 'https://via.placeholder.com/120x68.png?text=No+Thumbnail';
+                                videoTitle.textContent = data.data.title || 'סרטון ללא כותרת';
+                                
+                                // Format duration in seconds to MM:SS
+                                const durationSeconds = data.data.duration || 0;
+                                const minutes = Math.floor(durationSeconds / 60);
+                                const seconds = Math.floor(durationSeconds % 60);
+                                videoDuration.textContent = \`אורך: \${minutes}:\${seconds < 10 ? '0' : ''}\${seconds}\`;
+                                
+                                // Update download button
+                                const format = document.querySelector('input[name="format"]:checked').value;
+                                downloadBtn.href = \`/download?id=\${videoId}&format=\${format}\`;
+                                
+                                // Show preview
+                                preview.classList.add('active');
+                                
+                            } catch (error) {
+                                loading.style.display = 'none';
+                                showError(error.message);
+                            }
+                        });
+                        
+                        // Update download link when format changes
+                        document.querySelectorAll('input[name="format"]').forEach(radio => {
+                            radio.addEventListener('change', function() {
+                                if (preview.classList.contains('active')) {
+                                    const videoId = extractVideoId(urlInput.value);
+                                    const format = document.querySelector('input[name="format"]:checked').value;
+                                    downloadBtn.href = \`/download?id=\${videoId}&format=\${format}\`;
+                                }
+                            });
+                        });
+                        
+                        // Extract video ID from various YouTube URL formats
+                        function extractVideoId(url) {
+                            let videoId = null;
+                            
+                            // Check for standard youtube.com/watch?v= format
+                            const watchRegex = /youtube\\.com\\/watch\\?v=([^&]+)/;
+                            const watchMatch = url.match(watchRegex);
+                            if (watchMatch) {
+                                videoId = watchMatch[1];
+                            }
+                            
+                            // Check for youtu.be/ format
+                            const shortRegex = /youtu\\.be\\/([^?&]+)/;
+                            const shortMatch = url.match(shortRegex);
+                            if (shortMatch) {
+                                videoId = shortMatch[1];
+                            }
+                            
+                            // Check for youtube.com/v/ format
+                            const vRegex = /youtube\\.com\\/v\\/([^?&]+)/;
+                            const vMatch = url.match(vRegex);
+                            if (vMatch) {
+                                videoId = vMatch[1];
+                            }
+                            
+                            // Check for youtube.com/embed/ format
+                            const embedRegex = /youtube\\.com\\/embed\\/([^?&]+)/;
+                            const embedMatch = url.match(embedRegex);
+                            if (embedMatch) {
+                                videoId = embedMatch[1];
+                            }
+                            
+                            if (!videoId) {
+                                throw new Error('פורמט URL לא נתמך. נא להשתמש בכתובת סטנדרטית של YouTube.');
+                            }
+                            
+                            return videoId;
+                        }
+                        
+                        function showError(message) {
+                            errorBox.textContent = message;
+                            errorBox.style.display = 'block';
+                        }
+                    });
+                </script>
             </body>
         </html>
     `);
@@ -775,6 +1277,140 @@ app.get('/', (req, res) => {
 // Custom 404 handler
 app.use((req, res) => {
     res.status(404).send('Resource not found');
+});
+
+// Add a route to handle form submission
+app.get('/process', (req, res) => {
+    const url = req.query.url;
+    const format = req.query.format || 'combined';
+    
+    if (!url) {
+        return res.status(400).json({ error: 'Missing url parameter' });
+    }
+    
+    try {
+        // Extract video ID from the URL
+        let videoId = null;
+        
+        // Check for standard youtube.com/watch?v= format
+        const watchRegex = /youtube\.com\/watch\?v=([^&]+)/;
+        const watchMatch = url.match(watchRegex);
+        if (watchMatch) {
+            videoId = watchMatch[1];
+        }
+        
+        // Check for youtu.be/ format
+        const shortRegex = /youtu\.be\/([^?&]+)/;
+        const shortMatch = url.match(shortRegex);
+        if (shortMatch) {
+            videoId = shortMatch[1];
+        }
+        
+        // Check for youtube.com/v/ format
+        const vRegex = /youtube\.com\/v\/([^?&]+)/;
+        const vMatch = url.match(vRegex);
+        if (vMatch) {
+            videoId = vMatch[1];
+        }
+        
+        // Check for youtube.com/embed/ format
+        const embedRegex = /youtube\.com\/embed\/([^?&]+)/;
+        const embedMatch = url.match(embedRegex);
+        if (embedMatch) {
+            videoId = embedMatch[1];
+        }
+        
+        if (!videoId) {
+            return res.status(400).send(`
+                <html>
+                    <head>
+                        <title>שגיאה - פורמט לא חוקי</title>
+                        <meta charset="UTF-8">
+                        <style>
+                            body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: #f0f0f0; }
+                            .container { max-width: 600px; margin: 100px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                            h1 { color: #c00; margin-top: 0; }
+                            .back-btn { display: inline-block; margin-top: 20px; padding: 10px 20px; background: #c00; color: white; text-decoration: none; border-radius: 4px; }
+                            .back-btn:hover { background: #900; }
+                            .error-details { background: #ffe6e6; padding: 15px; border-radius: 4px; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>פורמט URL לא חוקי</h1>
+                            <p>לא ניתן לחלץ את מזהה הסרטון מהכתובת שהוזנה.</p>
+                            <div class="error-details">
+                                <p><strong>כתובת שהוזנה:</strong> ${url}</p>
+                                <p>נא להשתמש בכתובת סטנדרטית של YouTube בפורמט אחד מהבאים:</p>
+                                <ul>
+                                    <li>https://www.youtube.com/watch?v=VIDEO_ID</li>
+                                    <li>https://youtu.be/VIDEO_ID</li>
+                                    <li>https://www.youtube.com/embed/VIDEO_ID</li>
+                                </ul>
+                            </div>
+                            <a href="/" class="back-btn">חזרה לדף הראשי</a>
+                        </div>
+                    </body>
+                </html>
+            `);
+        }
+        
+        // Redirect to download endpoint with the extracted video ID
+        return res.redirect(`/download?id=${videoId}&format=${format}`);
+    } catch (error) {
+        console.error('Process error:', error);
+        return res.status(500).json({ error: `Failed to process URL: ${error.message}` });
+    }
+});
+
+// Add a YouTube info endpoint that accepts a URL
+app.get('/youtube-info-by-url', async (req, res) => {
+    const videoUrl = req.query.url;
+    
+    if (!videoUrl) {
+        return res.status(400).json({ 
+            error: 'Missing required parameter: url',
+            example: '/youtube-info-by-url?url=https://www.youtube.com/watch?v=VIDEOID'
+        });
+    }
+    
+    try {
+        // Extract video ID from the URL
+        let videoId = null;
+        
+        // Check various YouTube URL formats
+        const watchRegex = /youtube\.com\/watch\?v=([^&]+)/;
+        const shortRegex = /youtu\.be\/([^?&]+)/;
+        const vRegex = /youtube\.com\/v\/([^?&]+)/;
+        const embedRegex = /youtube\.com\/embed\/([^?&]+)/;
+        
+        const watchMatch = videoUrl.match(watchRegex);
+        const shortMatch = videoUrl.match(shortRegex);
+        const vMatch = videoUrl.match(vRegex);
+        const embedMatch = videoUrl.match(embedRegex);
+        
+        if (watchMatch) videoId = watchMatch[1];
+        else if (shortMatch) videoId = shortMatch[1];
+        else if (vMatch) videoId = vMatch[1];
+        else if (embedMatch) videoId = embedMatch[1];
+        
+        if (!videoId) {
+            return res.status(400).json({ 
+                error: 'Could not extract video ID from the provided URL',
+                url: videoUrl
+            });
+        }
+        
+        // Redirect to the youtube-info endpoint with the extracted ID
+        res.redirect(`/youtube-info?id=${videoId}`);
+        
+    } catch (error) {
+        console.error('YouTube info by URL error:', error);
+        res.status(500).json({
+            success: false,
+            error: `Failed to process URL: ${error.message}`
+        });
+    }
 });
 
 app.listen(PORT, () => {
