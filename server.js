@@ -9,10 +9,6 @@ const { execSync } = require('child_process');
 const https = require('https');
 const http = require('http');
 
-// Import required modules for FormData and Blob in Node.js
-const FormData = require('form-data');
-const { Blob } = require('buffer');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
