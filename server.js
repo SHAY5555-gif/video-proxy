@@ -88,6 +88,9 @@ app.get('/proxy', async (req, res) => {
     console.log(`Processing request for: ${videoUrl.substring(0, 100)}...`);
 
     try {
+        // Log more details about the request
+        console.log(`Request headers:`, JSON.stringify(req.headers, null, 2));
+        
         const fetchOptions = {
             headers: {
                 'User-Agent': userAgent,
@@ -99,6 +102,8 @@ app.get('/proxy', async (req, res) => {
             }
         };
         
+        console.log(`Fetch options:`, JSON.stringify(fetchOptions, null, 2));
+        
         // Use our enhanced fetch with retries
         const response = await fetchWithRetries(videoUrl, fetchOptions);
 
@@ -107,11 +112,20 @@ app.get('/proxy', async (req, res) => {
             return res.status(response.status).json({ error: `Failed to fetch: ${response.statusText}` });
         }
 
+        // Log response details before piping
+        console.log(`Response status: ${response.status}`);
+        console.log(`Response headers:`, JSON.stringify(Object.fromEntries([...response.headers.entries()]), null, 2));
+
         // Copy all response headers to our response
         for (const [key, value] of response.headers.entries()) {
             // Skip headers that might cause issues
             if (!['content-encoding', 'content-length', 'connection', 'transfer-encoding'].includes(key.toLowerCase())) {
-                res.setHeader(key, value);
+                try {
+                    res.setHeader(key, value);
+                } catch (headerErr) {
+                    console.error(`Error setting header ${key}: ${headerErr.message}`);
+                    // Continue despite header error
+                }
             }
         }
         
@@ -126,17 +140,43 @@ app.get('/proxy', async (req, res) => {
         // Optional: support partial content for larger files
         res.setHeader('Accept-Ranges', 'bytes');
         
-        // Pipe the response body to the client
-        response.body.pipe(res);
-        
-        // Log success with limited URL (for privacy/security)
-        const urlPreview = videoUrl.length > 60 ? 
-            `${videoUrl.substring(0, 30)}...${videoUrl.substring(videoUrl.length - 30)}` : 
-            videoUrl;
-        console.log(`Successfully proxied: ${urlPreview}`);
+        // Handle streaming with explicit error handling
+        try {
+            // Pipe the response body to the client
+            response.body.pipe(res);
+            
+            // Handle stream errors
+            response.body.on('error', (streamErr) => {
+                console.error('Stream error:', streamErr);
+                // At this point headers are already sent, so we can only close the connection
+                try {
+                    res.end();
+                } catch (e) {
+                    console.error('Error while ending response after stream error:', e);
+                }
+            });
+            
+            // Log when the stream is done
+            response.body.on('end', () => {
+                console.log('Stream completed successfully');
+            });
+            
+            // Log success with limited URL (for privacy/security)
+            const urlPreview = videoUrl.length > 60 ? 
+                `${videoUrl.substring(0, 30)}...${videoUrl.substring(videoUrl.length - 30)}` : 
+                videoUrl;
+            console.log(`Successfully piping response for: ${urlPreview}`);
+        } catch (streamSetupErr) {
+            console.error('Error setting up stream:', streamSetupErr);
+            // Only send error if headers have not been sent
+            if (!res.headersSent) {
+                return res.status(500).json({ error: `Stream setup error: ${streamSetupErr.message}` });
+            }
+        }
         
     } catch (err) {
         console.error('Proxy error:', err);
+        console.error('Error stack:', err.stack);
         
         // Send appropriate error based on the error type
         if (err.code === 'ENOTFOUND') {
@@ -148,8 +188,26 @@ app.get('/proxy', async (req, res) => {
                 error: 'Too Many Requests from source API',
                 retryAfter: 60 // Suggest retry after 1 minute
             });
+        } else if (err.message.includes('403')) {
+            return res.status(403).json({ 
+                error: 'Resource access forbidden (403)',
+                details: err.message
+            });
         } else {
-            res.status(500).json({ error: `Proxy server error: ${err.message}` });
+            // Log as much detail as possible about the error
+            console.error('Unhandled error details:', {
+                message: err.message,
+                name: err.name,
+                code: err.code,
+                errno: err.errno,
+                stack: err.stack && err.stack.split('\n')
+            });
+            
+            res.status(500).json({ 
+                error: `Proxy server error: ${err.message}`,
+                errorType: err.name || 'Unknown',
+                errorCode: err.code || 'None'
+            });
         }
     }
 });
