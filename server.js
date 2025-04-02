@@ -66,6 +66,26 @@ function rateLimiter(req, res, next) {
 app.use(cors());
 app.use(rateLimiter);
 
+// Add request logging middleware to see all incoming requests
+app.use((req, res, next) => {
+    const method = req.method;
+    const url = req.url;
+    const contentType = req.get('Content-Type') || 'none';
+    console.log(`[REQUEST] ${method} ${url} (Content-Type: ${contentType})`);
+    
+    // Log query parameters if present
+    if (Object.keys(req.query).length > 0) {
+        console.log(`[REQUEST QUERY] ${JSON.stringify(req.query)}`);
+    }
+    
+    // Log user agent
+    const userAgent = req.get('User-Agent') || 'unknown';
+    console.log(`[REQUEST AGENT] ${userAgent.substring(0, 100)}${userAgent.length > 100 ? '...' : ''}`);
+    
+    // Continue to next middleware
+    next();
+});
+
 // Fetch with retries
 async function fetchWithRetries(url, options, maxRetries = 3) {
     let lastError;
@@ -1810,556 +1830,103 @@ app.get('/', (req, res) => {
 
 // Custom 404 handler
 app.use((req, res) => {
-    res.status(404).send('Resource not found');
+    console.log(`[404] No handler found for ${req.method} ${req.url}`);
+    res.status(404).send(`
+        <html>
+            <head>
+                <title>404 - Not Found</title>
+                <meta charset="UTF-8">
+                <style>
+                    body { font-family: 'Segoe UI', Arial, sans-serif; margin: 40px; padding: 0; background: #f0f0f0; }
+                    h1 { color: #c00; font-size: 32px; }
+                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    code { background: #f8f8f8; padding: 2px 6px; border-radius: 3px; font-family: monospace; border: 1px solid #ddd; }
+                    .available-routes { margin-top: 20px; background: #f8f8f8; padding: 20px; border-radius: 8px; }
+                    ul { padding-left: 20px; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>404 - Not Found</h1>
+                    <p>The requested resource <code>${req.url}</code> was not found on this server.</p>
+                    
+                    <div class="available-routes">
+                        <h2>Available Routes</h2>
+                        <ul>
+                            <li><code>GET /</code> - Home page</li>
+                            <li><code>GET /proxy?url=URL</code> - Proxy endpoint</li>
+                            <li><code>GET /youtube-info?id=VIDEO_ID</code> - Get video formats</li>
+                            <li><code>GET /download?id=VIDEO_ID&format=audio|video|combined</code> - Download video</li>
+                            <li><code>GET /transcribe?id=VIDEO_ID&format=json|srt|txt</code> - Transcribe video</li>
+                            <li><code>GET /health</code> - Health check</li>
+                            <li><code>GET /test-proxy?url=URL</code> - Test proxy</li>
+                        </ul>
+                    </div>
+                </div>
+            </body>
+        </html>
+    `);
 });
 
-// Add a route to handle form submission
-app.get('/process', (req, res) => {
-    const url = req.query.url;
-    const format = req.query.format || 'combined';
-    
-    if (!url) {
-        return res.status(400).json({ error: 'Missing url parameter' });
-    }
-    
-    try {
-        // Extract video ID from the URL
-        let videoId = null;
-        
-        // Check for standard youtube.com/watch?v= format
-        const watchRegex = /youtube\.com\/watch\?v=([^&]+)/;
-        const watchMatch = url.match(watchRegex);
-        if (watchMatch) {
-            videoId = watchMatch[1];
-        }
-        
-        // Check for youtu.be/ format
-        const shortRegex = /youtu\.be\/([^?&]+)/;
-        const shortMatch = url.match(shortRegex);
-        if (shortMatch) {
-            videoId = shortMatch[1];
-        }
-        
-        // Check for youtube.com/v/ format
-        const vRegex = /youtube\.com\/v\/([^?&]+)/;
-        const vMatch = url.match(vRegex);
-        if (vMatch) {
-            videoId = vMatch[1];
-        }
-        
-        // Check for youtube.com/embed/ format
-        const embedRegex = /youtube\.com\/embed\/([^?&]+)/;
-        const embedMatch = url.match(embedRegex);
-        if (embedMatch) {
-            videoId = embedMatch[1];
-        }
-        
-        if (!videoId) {
-            return res.status(400).send(`
-                <html>
-                    <head>
-                        <title>שגיאה - פורמט לא חוקי</title>
-                        <meta charset="UTF-8">
-                        <style>
-                            body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: #f0f0f0; }
-                            .container { max-width: 600px; margin: 100px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                            h1 { color: #c00; margin-top: 0; }
-                            .back-btn { display: inline-block; margin-top: 20px; padding: 10px 20px; background: #c00; color: white; text-decoration: none; border-radius: 4px; }
-                            .back-btn:hover { background: #900; }
-                            .error-details { background: #ffe6e6; padding: 15px; border-radius: 4px; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>פורמט URL לא חוקי</h1>
-                            <p>לא ניתן לחלץ את מזהה הסרטון מהכתובת שהוזנה.</p>
-                            <div class="error-details">
-                                <p><strong>כתובת שהוזנה:</strong> ${url}</p>
-                                <p>נא להשתמש בכתובת סטנדרטית של YouTube בפורמט אחד מהבאים:</p>
-                                <ul>
-                                    <li>https://www.youtube.com/watch?v=VIDEO_ID</li>
-                                    <li>https://youtu.be/VIDEO_ID</li>
-                                    <li>https://www.youtube.com/embed/VIDEO_ID</li>
-                                </ul>
-                            </div>
-                            <a href="/" class="back-btn">חזרה לדף הראשי</a>
-                        </div>
-                    </body>
-                </html>
-            `);
-        }
-        
-        // Redirect to download endpoint with the extracted video ID
-        return res.redirect(`/download?id=${videoId}&format=${format}`);
-    } catch (error) {
-        console.error('Process error:', error);
-        return res.status(500).json({ error: `Failed to process URL: ${error.message}` });
-    }
-});
-
-// Add a YouTube info endpoint that accepts a URL
-app.get('/youtube-info-by-url', async (req, res) => {
-    const videoUrl = req.query.url;
-    
-    if (!videoUrl) {
-        return res.status(400).json({ 
-            error: 'Missing required parameter: url',
-            example: '/youtube-info-by-url?url=https://www.youtube.com/watch?v=VIDEOID'
-        });
-    }
-    
-    try {
-        // Extract video ID from the URL
-        let videoId = null;
-        
-        // Check various YouTube URL formats
-        const watchRegex = /youtube\.com\/watch\?v=([^&]+)/;
-        const shortRegex = /youtu\.be\/([^?&]+)/;
-        const vRegex = /youtube\.com\/v\/([^?&]+)/;
-        const embedRegex = /youtube\.com\/embed\/([^?&]+)/;
-        
-        const watchMatch = videoUrl.match(watchRegex);
-        const shortMatch = videoUrl.match(shortRegex);
-        const vMatch = videoUrl.match(vRegex);
-        const embedMatch = videoUrl.match(embedRegex);
-        
-        if (watchMatch) videoId = watchMatch[1];
-        else if (shortMatch) videoId = shortMatch[1];
-        else if (vMatch) videoId = vMatch[1];
-        else if (embedMatch) videoId = embedMatch[1];
-        
-        if (!videoId) {
-            return res.status(400).json({ 
-                error: 'Could not extract video ID from the provided URL',
-                url: videoUrl
-            });
-        }
-        
-        // Redirect to the youtube-info endpoint with the extracted ID
-        res.redirect(`/youtube-info?id=${videoId}`);
-        
-    } catch (error) {
-        console.error('YouTube info by URL error:', error);
-        res.status(500).json({
-            success: false,
-            error: `Failed to process URL: ${error.message}`
-        });
-    }
-});
-
-// Helper function to convert words from ElevenLabs to SRT
-function convertWordsToSrt(words) {
-    if (!words || words.length === 0) return '';
-
-    let srt = '';
-    let lineIndex = 1;
-    let currentLineWords = []; // Store word objects for the current line
-    let lineStartTime = -1;
-
-    // Helper function to format time in SRT format (HH:MM:SS,ms)
-    function formatTime(seconds) {
-        const date = new Date(0);
-        date.setSeconds(seconds);
-        const timeStr = date.toISOString().substr(11, 12);
-        return timeStr.replace('.', ',');
-    }
-
-    // Helper function to check if a word ends with required punctuation
-    function endsWithPunctuation(wordText) {
-        const trimmedText = wordText.trim();
-        // Updated regex to include Chinese punctuation: 。？！
-        return /[.?!。？！]$/.test(trimmedText);
-    }
-
-    // Helper function to finalize and add a line to the SRT string
-    function finalizeLine() {
-        if (currentLineWords.length === 0) return;
-
-        const lineText = currentLineWords.map(w => w.text).join(' ').trim();
-        const lineEndTime = currentLineWords[currentLineWords.length - 1].end;
-
-        srt += `${lineIndex}\n`;
-        srt += `${formatTime(lineStartTime)} --> ${formatTime(lineEndTime)}\n`;
-        srt += `${lineText}\n\n`;
-
-        lineIndex++;
-        currentLineWords = []; // Reset for the next line
-        lineStartTime = -1;
-    }
-
-    for (let i = 0; i < words.length; i++) {
-        const word = words[i];
-
-        // Skip non-word types or empty words
-        if (word.type !== 'word' || !word.text.trim()) continue;
-
-        // Start of a new line
-        if (lineStartTime === -1) {
-            lineStartTime = word.start;
-        }
-
-        // Add the word to the current line buffer
-        currentLineWords.push(word);
-
-        // Check conditions for finalizing the line:
-        // 1. Current word ends with punctuation AND we have at least 5 words.
-        // 2. It's the very last word in the input array.
-        const isPunctuationEnd = endsWithPunctuation(word.text);
-        const hasEnoughWords = currentLineWords.length >= 5;
-        const isLastWord = (i === words.length - 1);
-
-        if ((isPunctuationEnd && hasEnoughWords) || isLastWord) {
-            finalizeLine();
-        }
-        // If it ends with punctuation but not enough words, we just continue accumulating
-    }
-
-    // Ensure any remaining words are added if the loop finishes without finalizing
-    if (currentLineWords.length > 0) {
-        finalizeLine();
-    }
-
-    return srt;
-}
-
-// Helper function to convert words to plain text
-function convertWordsToPlainText(words) {
-    if (!words || words.length === 0) return '';
-    
-    // Just extract the text from each word object and join them
-    return words
-        .filter(word => word.type === 'word' && word.text.trim())
-        .map(word => word.text)
-        .join(' ')
-        .trim()
-        // Fix common spacing issues around punctuation
-        .replace(/ ([,.!?;:])(?= |$)/g, '$1')
-        // Fix spacing for closing quotes/parentheses
-        .replace(/ (["\)\]\}])/g, '$1')
-        // Fix spacing for opening quotes/parentheses
-        .replace(/(["\(\[\{]) /g, '$1');
-}
-
-// Add a new endpoint for transcription
-app.get('/transcribe', async (req, res) => {
-    const videoId = req.query.id;
-    const videoUrl = req.query.url;
-    const format = req.query.format || 'all'; // 'json', 'srt', 'txt', or 'all'
-    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
-    
-    // We need either video ID or full URL
-    if (!videoId && !videoUrl) {
-        return res.status(400).json({ 
-            success: false,
-            error: 'חסר פרמטר חובה: id או url',
-            example: '/transcribe?id=YOUTUBE_VIDEO_ID או /transcribe?url=https://www.youtube.com/watch?v=VIDEOID'
-        });
-    }
-    
-    try {
-        console.log(`[${requestId}] Starting transcription process for video ID: ${videoId || 'from URL'}`);
-        
-        // Step 1: Get video information to find the audio URL
-        let resolvedVideoId = videoId;
-        
-        // If we only have the URL, extract the video ID
-        if (!resolvedVideoId && videoUrl) {
-            // Extract video ID from URL
-            const watchRegex = /youtube\.com\/watch\?v=([^&]+)/;
-            const shortRegex = /youtu\.be\/([^?&]+)/;
-            const vRegex = /youtube\.com\/v\/([^?&]+)/;
-            const embedRegex = /youtube\.com\/embed\/([^?&]+)/;
-            
-            const watchMatch = videoUrl.match(watchRegex);
-            const shortMatch = videoUrl.match(shortRegex);
-            const vMatch = videoUrl.match(vRegex);
-            const embedMatch = videoUrl.match(embedRegex);
-            
-            if (watchMatch) resolvedVideoId = watchMatch[1];
-            else if (shortMatch) resolvedVideoId = shortMatch[1];
-            else if (vMatch) resolvedVideoId = vMatch[1];
-            else if (embedMatch) resolvedVideoId = embedMatch[1];
-            
-            if (!resolvedVideoId) {
-                throw new Error('לא ניתן לחלץ מזהה סרטון מה-URL שסופק');
-            }
-        }
-        
-        // Get video info using our existing endpoint
-        console.log(`[${requestId}] Fetching video info for ID: ${resolvedVideoId}`);
-        const infoUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/youtube-info?id=${resolvedVideoId}`;
-        const infoResponse = await fetch(infoUrl);
-        
-        if (!infoResponse.ok) {
-            const errorText = await infoResponse.text();
-            throw new Error(`שגיאה בקבלת מידע על הסרטון: ${infoResponse.status}. ${errorText}`);
-        }
-        
-        const infoData = await infoResponse.json();
-        
-        if (!infoData.success || !infoData.data) {
-            throw new Error('תגובה לא תקפה מנקודת הקצה של מידע הסרטון');
-        }
-        
-        // Step 2: Find the best audio URL
-        let audioUrl = null;
-        
-        // First try to get the audio-only format for best efficiency
-        if (infoData.data.recommended && infoData.data.recommended.audio && infoData.data.recommended.audio.url) {
-            audioUrl = infoData.data.recommended.audio.url;
-            console.log(`[${requestId}] Using recommended audio-only format`);
-        } 
-        // If no audio-only format, try alternative audio formats
-        else if (infoData.data.formats && infoData.data.formats.audio && infoData.data.formats.audio.length > 0) {
-            audioUrl = infoData.data.formats.audio[0].url;
-            console.log(`[${requestId}] Using alternative audio format`);
-        }
-        // If no audio formats at all, try combined/video format
-        else if (infoData.data.recommended && infoData.data.recommended.combined && infoData.data.recommended.combined.url) {
-            audioUrl = infoData.data.recommended.combined.url;
-            console.log(`[${requestId}] Using combined video/audio format (no audio-only available)`);
-        } else {
-            throw new Error('לא נמצא פורמט אודיו זמין לסרטון זה');
-        }
-        
-        if (!audioUrl) {
-            throw new Error('לא ניתן למצוא כתובת URL לאודיו של הסרטון');
-        }
-        
-        // Step 3: Download the audio file to a temporary location on the server
-        console.log(`[${requestId}] Downloading audio file...`);
-        
-        // Use our proxy to download the file (avoid CORS/YouTube restrictions)
-        const proxyUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/proxy?url=${encodeURIComponent(audioUrl)}`;
-        
-        // Prepare a filename for the temporary audio file
-        const tempAudioPath = path.join(TEMP_DIR, `${resolvedVideoId}_${Date.now()}.mp3`);
-        
-        // Download the file using our existing proxy
-        const audioResponse = await fetch(proxyUrl);
-        
-        if (!audioResponse.ok) {
-            throw new Error(`שגיאה בהורדת קובץ האודיו: ${audioResponse.status} ${audioResponse.statusText}`);
-        }
-        
-        // Save the audio response to the temp file
-        const audioBuffer = await audioResponse.arrayBuffer();
-        fs.writeFileSync(tempAudioPath, Buffer.from(audioBuffer));
-        
-        console.log(`[${requestId}] Audio file downloaded and saved to: ${tempAudioPath}`);
-        
-        // Step 4: Send the audio file to ElevenLabs for transcription using native Node.js methods
-        console.log(`[${requestId}] Sending audio to ElevenLabs for transcription...`);
-        
-        // Function to make multipart form requests without form-data package
-        const sendMultipartFormRequest = (url, options = {}) => {
-            return new Promise((resolve, reject) => {
-                try {
-                    // Generate boundary string for multipart form
-                    const boundary = `--------------------------${Math.random().toString(36).slice(2)}`;
-                    
-                    // Read the file
-                    const fileStats = fs.statSync(tempAudioPath);
-                    const fileData = fs.readFileSync(tempAudioPath);
-                    
-                    // Create multipart form body
-                    const postData = [];
-                    
-                    // Add form fields
-                    const fields = {
-                        'model_id': 'scribe_v1',
-                        'timestamps_granularity': 'word',
-                        'language': ''
-                    };
-                    
-                    // Append form fields to multipart data
-                    Object.keys(fields).forEach(key => {
-                        const value = fields[key];
-                        postData.push(Buffer.from(`--${boundary}\r\n`));
-                        postData.push(Buffer.from(`Content-Disposition: form-data; name="${key}"\r\n\r\n`));
-                        postData.push(Buffer.from(`${value}\r\n`));
-                    });
-                    
-                    // Append file data
-                    const filename = path.basename(tempAudioPath);
-                    postData.push(Buffer.from(`--${boundary}\r\n`));
-                    postData.push(Buffer.from(`Content-Disposition: form-data; name="file"; filename="${filename}"\r\n`));
-                    postData.push(Buffer.from(`Content-Type: audio/mpeg\r\n\r\n`));
-                    postData.push(fileData);
-                    postData.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-                    
-                    // Calculate total content length
-                    const postDataBuffer = Buffer.concat(postData);
-                    
-                    // Set up request options
-                    const requestOptions = {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                            'Content-Length': postDataBuffer.length,
-                            'xi-api-key': ELEVENLABS_API_KEY
-                        },
-                        ...options
-                    };
-                    
-                    // Make the request
-                    const request = https.request(url, requestOptions, (response) => {
-                        let data = '';
-                        
-                        response.on('data', (chunk) => {
-                            data += chunk;
-                        });
-                        
-                        response.on('end', () => {
-                            if (response.statusCode >= 200 && response.statusCode < 300) {
-                                try {
-                                    const jsonData = JSON.parse(data);
-                                    resolve({ response, data: jsonData });
-                                } catch (error) {
-                                    reject(new Error(`Invalid JSON response: ${error.message}`));
-                                }
-                            } else {
-                                reject(new Error(`HTTP Error: ${response.statusCode} ${response.statusMessage}. Body: ${data}`));
-                            }
-                        });
-                    });
-                    
-                    request.on('error', (error) => {
-                        reject(error);
-                    });
-                    
-                    // Write data and end request
-                    request.write(postDataBuffer);
-                    request.end();
-                } catch (error) {
-                    reject(error);
-                }
-            });
-        };
-        
-        // Try ElevenLabs API with retries
-        let transcriptionData;
-        let apiRetries = 2; // Fewer retries for API to avoid excessive costs
-        let apiDelay = 2000; // Start with 2 seconds
-        let apiSuccess = false;
-        
-        for (let attempt = 1; attempt <= apiRetries + 1; attempt++) {
-            try {
-                console.log(`[${requestId}] ElevenLabs API attempt ${attempt}/${apiRetries + 1}`);
-                
-                const { response, data } = await sendMultipartFormRequest('https://api.elevenlabs.io/v1/speech-to-text');
-                
-                if (response.statusCode !== 200) {
-                    throw new Error(`ElevenLabs API responded with status ${response.statusCode}`);
-                }
-                
-                transcriptionData = data;
-                apiSuccess = true;
-                break; // Exit loop on success
-            } catch (apiError) {
-                console.warn(`[${requestId}] ElevenLabs API attempt ${attempt} failed:`, apiError);
-                
-                if (attempt <= apiRetries) {
-                    console.log(`[${requestId}] Waiting ${apiDelay}ms before API retry...`);
-                    await new Promise(resolve => setTimeout(resolve, apiDelay));
-                    apiDelay *= 2; // Exponential backoff
-                } else {
-                    // Last attempt failed, clean up and rethrow
-                    cleanupTempFile(tempAudioPath);
-                    throw new Error(`שגיאת API מ-ElevenLabs: ${apiError.message}`);
-                }
-            }
-        }
-        
-        if (!apiSuccess) {
-            cleanupTempFile(tempAudioPath);
-            throw new Error("כל נסיונות התמלול ל-ElevenLabs נכשלו");
-        }
-        
-        // Clean up the temporary audio file
-        cleanupTempFile(tempAudioPath);
-        
-        if (!transcriptionData.words || !Array.isArray(transcriptionData.words)) {
-            throw new Error("התקבלו נתוני תמלול לא תקינים מ-ElevenLabs");
-        }
-        
-        // Step 5: Convert results to requested format(s)
-        console.log(`[${requestId}] Converting results to requested format: ${format}`);
-        
-        // Create the SRT version
-        const srtContent = convertWordsToSrt(transcriptionData.words);
-        
-        // Create the plain text version
-        const textContent = convertWordsToPlainText(transcriptionData.words);
-        
-        // Prepare the JSON version (full ElevenLabs response)
-        const jsonContent = {
-            metadata: {
-                title: infoData.data.title || `YouTube Video ${resolvedVideoId}`,
-                videoId: resolvedVideoId,
-                duration: infoData.data.duration || 0,
-                language: transcriptionData.language || 'unknown',
-                timestamp: new Date().toISOString()
-            },
-            transcript: {
-                text: textContent,
-                words: transcriptionData.words
-            }
-        };
-        
-        // Step 6: Return results based on requested format
-        if (format === 'json') {
-            res.json({
-                success: true,
-                data: jsonContent
-            });
-        } else if (format === 'srt') {
-            res.setHeader('Content-Type', 'text/plain; charset=UTF-8');
-            res.setHeader('Content-Disposition', `attachment; filename="${resolvedVideoId}_transcript.srt"`);
-            res.send(srtContent);
-        } else if (format === 'txt') {
-            res.setHeader('Content-Type', 'text/plain; charset=UTF-8');
-            res.setHeader('Content-Disposition', `attachment; filename="${resolvedVideoId}_transcript.txt"`);
-            res.send(textContent);
-        } else {
-            // Default: return all formats
-            res.json({
-                success: true,
-                data: {
-                    metadata: jsonContent.metadata,
-                    formats: {
-                        json: jsonContent,
-                        srt: srtContent,
-                        txt: textContent
-                    }
-                }
-            });
-        }
-        
-        console.log(`[${requestId}] Transcription process completed successfully`);
-        
-    } catch (error) {
-        console.error(`[${requestId}] Transcription error:`, error);
-        
-        res.status(500).json({
-            success: false,
-            error: `שגיאה בתהליך התמלול: ${error.message}`
-        });
-    }
-});
-
-// Helper function to clean up temporary files
-function cleanupTempFile(filePath) {
-    try {
-        if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-            console.log(`Deleted temporary file: ${filePath}`);
-        }
-    } catch (error) {
-        console.error(`Error deleting temporary file ${filePath}:`, error);
-    }
-}
-
+// Default port listener
 app.listen(PORT, () => {
-    console.log(`Proxy server listening on port ${PORT}`);
-}); 
+    console.log('----------------------------------------------------');
+    console.log(`Proxy server STARTED and listening on port ${PORT}`);
+    console.log('Available routes:');
+    console.log('  - GET /                                      Home page');
+    console.log('  - GET /proxy?url=URL                         Proxy endpoint');
+    console.log('  - GET /youtube-info?id=VIDEO_ID              Get video formats');
+    console.log('  - GET /download?id=VIDEO_ID&format=FORMAT    Download video');
+    console.log('  - GET /transcribe?id=VIDEO_ID&format=FORMAT  Transcribe video');
+    console.log('  - GET /health                                Health check');
+    console.log('  - GET /test-proxy?url=URL                    Test proxy');
+    console.log('----------------------------------------------------');
+});
+
+// Add health check endpoint to verify server is running
+app.get('/health', (req, res) => {
+    console.log('Health check performed');
+    return res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        endpoints: ['/proxy', '/youtube-info', '/transcribe', '/download']
+    });
+});
+
+// Add debug endpoint to test proxy functionality
+app.get('/test-proxy', async (req, res) => {
+    const testUrl = req.query.url || 'https://www.google.com/favicon.ico';
+    const requestId = Date.now().toString(36);
+    
+    console.log(`[${requestId}] Testing proxy with URL: ${testUrl}`);
+    
+    try {
+        const proxyUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/proxy?url=${encodeURIComponent(testUrl)}`;
+        console.log(`[${requestId}] Constructed proxy URL: ${proxyUrl}`);
+        
+        const response = await fetch(proxyUrl);
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Proxy test failed: ${response.status} ${response.statusText}. Body: ${errorText}`);
+        }
+        
+        const data = await response.buffer();
+        
+        res.json({
+            success: true,
+            url: testUrl,
+            proxyUrl: proxyUrl,
+            status: response.status,
+            contentType: response.headers.get('content-type'),
+            contentLength: data.length,
+            message: `Successfully proxied ${data.length} bytes`
+        });
+    } catch (error) {
+        console.error(`[${requestId}] Test proxy error:`, error);
+        res.status(500).json({
+            success: false,
+            error: `Test failed: ${error.message}`
+        });
+    }
+});
