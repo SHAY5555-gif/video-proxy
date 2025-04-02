@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
+const https = require('https');
+const http = require('http');
 
 // Import required modules for FormData and Blob in Node.js
 const FormData = require('form-data');
@@ -2150,32 +2152,97 @@ app.get('/transcribe', async (req, res) => {
         
         console.log(`[${requestId}] Audio file downloaded and saved to: ${tempAudioPath}`);
         
-        // Step 4: Send the audio file to ElevenLabs for transcription
+        // Step 4: Send the audio file to ElevenLabs for transcription using native Node.js methods
         console.log(`[${requestId}] Sending audio to ElevenLabs for transcription...`);
         
-        // Use the Node.js version of FormData
-        const formData = new FormData();
-        // Add the file as a stream instead of using Blob
-        formData.append('file', fs.createReadStream(tempAudioPath), {
-            filename: `${resolvedVideoId}.mp3`,
-            contentType: 'audio/mpeg'
-        });
-        formData.append('model_id', 'scribe_v1');
-        formData.append('timestamps_granularity', 'word');
-        formData.append('language', ''); // Auto-detect language
-        
-        const elevenLabsUrl = 'https://api.elevenlabs.io/v1/speech-to-text';
-        const formHeaders = formData.getHeaders();
-        formHeaders['xi-api-key'] = ELEVENLABS_API_KEY;
-        
-        const elevenLabsOptions = {
-            method: 'POST',
-            headers: formHeaders,
-            body: formData
+        // Function to make multipart form requests without form-data package
+        const sendMultipartFormRequest = (url, options = {}) => {
+            return new Promise((resolve, reject) => {
+                try {
+                    // Generate boundary string for multipart form
+                    const boundary = `--------------------------${Math.random().toString(36).slice(2)}`;
+                    
+                    // Read the file
+                    const fileStats = fs.statSync(tempAudioPath);
+                    const fileData = fs.readFileSync(tempAudioPath);
+                    
+                    // Create multipart form body
+                    const postData = [];
+                    
+                    // Add form fields
+                    const fields = {
+                        'model_id': 'scribe_v1',
+                        'timestamps_granularity': 'word',
+                        'language': ''
+                    };
+                    
+                    // Append form fields to multipart data
+                    Object.keys(fields).forEach(key => {
+                        const value = fields[key];
+                        postData.push(Buffer.from(`--${boundary}\r\n`));
+                        postData.push(Buffer.from(`Content-Disposition: form-data; name="${key}"\r\n\r\n`));
+                        postData.push(Buffer.from(`${value}\r\n`));
+                    });
+                    
+                    // Append file data
+                    const filename = path.basename(tempAudioPath);
+                    postData.push(Buffer.from(`--${boundary}\r\n`));
+                    postData.push(Buffer.from(`Content-Disposition: form-data; name="file"; filename="${filename}"\r\n`));
+                    postData.push(Buffer.from(`Content-Type: audio/mpeg\r\n\r\n`));
+                    postData.push(fileData);
+                    postData.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+                    
+                    // Calculate total content length
+                    const postDataBuffer = Buffer.concat(postData);
+                    
+                    // Set up request options
+                    const requestOptions = {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                            'Content-Length': postDataBuffer.length,
+                            'xi-api-key': ELEVENLABS_API_KEY
+                        },
+                        ...options
+                    };
+                    
+                    // Make the request
+                    const request = https.request(url, requestOptions, (response) => {
+                        let data = '';
+                        
+                        response.on('data', (chunk) => {
+                            data += chunk;
+                        });
+                        
+                        response.on('end', () => {
+                            if (response.statusCode >= 200 && response.statusCode < 300) {
+                                try {
+                                    const jsonData = JSON.parse(data);
+                                    resolve({ response, data: jsonData });
+                                } catch (error) {
+                                    reject(new Error(`Invalid JSON response: ${error.message}`));
+                                }
+                            } else {
+                                reject(new Error(`HTTP Error: ${response.statusCode} ${response.statusMessage}. Body: ${data}`));
+                            }
+                        });
+                    });
+                    
+                    request.on('error', (error) => {
+                        reject(error);
+                    });
+                    
+                    // Write data and end request
+                    request.write(postDataBuffer);
+                    request.end();
+                } catch (error) {
+                    reject(error);
+                }
+            });
         };
         
         // Try ElevenLabs API with retries
-        let transcriptionResponse;
+        let transcriptionData;
         let apiRetries = 2; // Fewer retries for API to avoid excessive costs
         let apiDelay = 2000; // Start with 2 seconds
         let apiSuccess = false;
@@ -2183,20 +2250,14 @@ app.get('/transcribe', async (req, res) => {
         for (let attempt = 1; attempt <= apiRetries + 1; attempt++) {
             try {
                 console.log(`[${requestId}] ElevenLabs API attempt ${attempt}/${apiRetries + 1}`);
-                transcriptionResponse = await fetch(elevenLabsUrl, elevenLabsOptions);
                 
-                if (!transcriptionResponse.ok) {
-                    let errorBody = await transcriptionResponse.text();
-                    try { 
-                        errorBody = JSON.stringify(JSON.parse(errorBody), null, 2); 
-                    } catch (e) { 
-                        /* Ignore parsing error */ 
-                    }
-                    
-                    console.error(`[${requestId}] ElevenLabs API Error Response (${transcriptionResponse.status}):`, errorBody);
-                    throw new Error(`שגיאת API מ-ElevenLabs: ${transcriptionResponse.status} ${transcriptionResponse.statusText}`);
+                const { response, data } = await sendMultipartFormRequest('https://api.elevenlabs.io/v1/speech-to-text');
+                
+                if (response.statusCode !== 200) {
+                    throw new Error(`ElevenLabs API responded with status ${response.statusCode}`);
                 }
                 
+                transcriptionData = data;
                 apiSuccess = true;
                 break; // Exit loop on success
             } catch (apiError) {
@@ -2209,7 +2270,7 @@ app.get('/transcribe', async (req, res) => {
                 } else {
                     // Last attempt failed, clean up and rethrow
                     cleanupTempFile(tempAudioPath);
-                    throw apiError;
+                    throw new Error(`שגיאת API מ-ElevenLabs: ${apiError.message}`);
                 }
             }
         }
@@ -2219,10 +2280,6 @@ app.get('/transcribe', async (req, res) => {
             throw new Error("כל נסיונות התמלול ל-ElevenLabs נכשלו");
         }
         
-        // Step 5: Process the transcription response
-        console.log(`[${requestId}] Processing transcription response...`);
-        const transcriptionData = await transcriptionResponse.json();
-        
         // Clean up the temporary audio file
         cleanupTempFile(tempAudioPath);
         
@@ -2230,7 +2287,7 @@ app.get('/transcribe', async (req, res) => {
             throw new Error("התקבלו נתוני תמלול לא תקינים מ-ElevenLabs");
         }
         
-        // Step 6: Convert results to requested format(s)
+        // Step 5: Convert results to requested format(s)
         console.log(`[${requestId}] Converting results to requested format: ${format}`);
         
         // Create the SRT version
@@ -2254,7 +2311,7 @@ app.get('/transcribe', async (req, res) => {
             }
         };
         
-        // Step 7: Return results based on requested format
+        // Step 6: Return results based on requested format
         if (format === 'json') {
             res.json({
                 success: true,
