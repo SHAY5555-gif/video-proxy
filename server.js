@@ -470,6 +470,259 @@ app.get('/proxy', async (req, res) => {
     }
 });
 
+// Add YouTube info API integration with ZM.io.vn
+app.get('/youtube-info', async (req, res) => {
+    const videoId = req.query.id;
+    const videoUrl = req.query.url;
+    
+    // We need either video ID or full URL
+    if (!videoId && !videoUrl) {
+        return res.status(400).json({ 
+            error: 'Missing required parameter: id or url',
+            example: '/youtube-info?id=VIDEOID or /youtube-info?url=https://www.youtube.com/watch?v=VIDEOID'
+        });
+    }
+
+    // Create a request ID for tracking
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    
+    try {
+        // Construct the YouTube URL if only ID was provided
+        let fullUrl = videoUrl;
+        if (!fullUrl && videoId) {
+            fullUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        }
+        
+        console.log(`[${requestId}] Fetching video info from ZM API for: ${fullUrl}`);
+        
+        // ZM API configuration
+        const zmApiKey = "hBsrDies"; // API key as in content.js
+        const zmApiUrl = 'https://api.zm.io.vn/v1/social/autolink';
+        
+        // Make request to ZM API
+        const zmOptions = {
+            method: 'POST',
+            headers: {
+                'apikey': zmApiKey, 
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ url: fullUrl })
+        };
+        
+        // Fetch with retries
+        let zmResponse;
+        let retryCount = 0;
+        const maxRetries = 3;
+        let delay = 1000;
+        
+        while (retryCount < maxRetries) {
+            try {
+                console.log(`[${requestId}] ZM API request attempt ${retryCount + 1}`);
+                zmResponse = await fetch(zmApiUrl, zmOptions);
+                
+                if (zmResponse.ok) {
+                    break; // Success
+                } else if (zmResponse.status === 429) {
+                    // Rate limited
+                    console.log(`[${requestId}] ZM API rate limited, retrying in ${delay}ms`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2; // Exponential backoff
+                    retryCount++;
+                } else {
+                    // Other error
+                    const errorText = await zmResponse.text();
+                    throw new Error(`ZM API error: ${zmResponse.status} ${zmResponse.statusText}. Body: ${errorText}`);
+                }
+            } catch (err) {
+                if (retryCount < maxRetries - 1) {
+                    console.log(`[${requestId}] ZM API request failed, retrying: ${err.message}`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2;
+                    retryCount++;
+                } else {
+                    throw err;
+                }
+            }
+        }
+        
+        if (!zmResponse || !zmResponse.ok) {
+            throw new Error('Failed to get response from ZM API after multiple attempts');
+        }
+        
+        // Parse the ZM API response
+        const zmData = await zmResponse.json();
+        
+        if (!zmData || !zmData.medias || !Array.isArray(zmData.medias)) {
+            throw new Error('Invalid data format received from ZM API');
+        }
+        
+        console.log(`[${requestId}] ZM API responded with ${zmData.medias.length} media options`);
+        
+        // Process and organize the media formats
+        const processedData = {
+            title: zmData.title || "",
+            thumbnail: zmData.thumbnail || "",
+            duration: zmData.duration || 0,
+            source: "zm.io.vn",
+            formats: {
+                video: [],
+                audio: []
+            },
+            // Include some recommended formats for convenience
+            recommended: {
+                video: null,
+                audio: null,
+                combined: null
+            }
+        };
+        
+        // Process media options and categorize them
+        zmData.medias.forEach(media => {
+            // Create a clean format object
+            const format = {
+                url: media.url,
+                quality: media.quality || media.label || "Unknown",
+                formatId: media.formatId || "unknown",
+                type: media.type || (media.quality && media.quality.includes('audio') ? 'audio' : 'video'),
+                ext: media.ext || "mp4",
+                size: media.size || null,
+                bitrate: media.bitrate || null
+            };
+            
+            // Categorize as audio or video
+            if (format.type === 'audio' || format.quality.toLowerCase().includes('audio')) {
+                processedData.formats.audio.push(format);
+                // Use first audio or lowest bitrate audio as recommended
+                if (!processedData.recommended.audio || 
+                    (format.bitrate && 
+                     processedData.recommended.audio.bitrate && 
+                     format.bitrate < processedData.recommended.audio.bitrate)) {
+                    processedData.recommended.audio = format;
+                }
+            } else {
+                processedData.formats.video.push(format);
+                // Track a decent quality video for recommendation
+                if (format.formatId === '18' || format.quality.includes('360p')) {
+                    processedData.recommended.combined = format;
+                }
+                // Use medium quality as recommended video
+                if (!processedData.recommended.video && (
+                    format.quality.includes('720p') ||
+                    format.quality.includes('480p'))) {
+                    processedData.recommended.video = format;
+                }
+            }
+        });
+        
+        // Ensure we have recommendations
+        if (!processedData.recommended.video && processedData.formats.video.length > 0) {
+            processedData.recommended.video = processedData.formats.video[0];
+        }
+        if (!processedData.recommended.audio && processedData.formats.audio.length > 0) {
+            processedData.recommended.audio = processedData.formats.audio[0];
+        }
+        if (!processedData.recommended.combined) {
+            processedData.recommended.combined = processedData.recommended.video || processedData.recommended.audio;
+        }
+        
+        // Return processed data
+        res.json({
+            success: true,
+            data: processedData
+        });
+        
+    } catch (error) {
+        console.error(`[${requestId}] Error fetching video info:`, error);
+        res.status(500).json({
+            success: false,
+            error: `Failed to get video information: ${error.message}`
+        });
+    }
+});
+
+// Add a direct download endpoint that uses the ZM data
+app.get('/download', async (req, res) => {
+    const videoId = req.query.id;
+    const format = req.query.format || 'combined'; // 'video', 'audio', or 'combined'
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    
+    if (!videoId) {
+        return res.status(400).json({ error: 'Missing required parameter: id' });
+    }
+    
+    try {
+        console.log(`[${requestId}] Download request for video ID: ${videoId}, format: ${format}`);
+        
+        // First fetch the video info using our own API
+        const infoUrl = `https://${req.headers.host}/youtube-info?id=${videoId}`;
+        const infoResponse = await fetch(infoUrl);
+        
+        if (!infoResponse.ok) {
+            let errorText = await infoResponse.text();
+            throw new Error(`Failed to get video info: ${errorText}`);
+        }
+        
+        const infoData = await infoResponse.json();
+        
+        if (!infoData.success || !infoData.data) {
+            throw new Error('Invalid response from youtube-info endpoint');
+        }
+        
+        // Select the appropriate format
+        let downloadUrl;
+        let filename;
+        
+        if (format === 'audio') {
+            if (infoData.data.recommended.audio && infoData.data.recommended.audio.url) {
+                downloadUrl = infoData.data.recommended.audio.url;
+                const ext = infoData.data.recommended.audio.ext || 'mp3';
+                filename = `${infoData.data.title || videoId}_audio.${ext}`;
+            } else {
+                throw new Error('No audio format available');
+            }
+        } else if (format === 'video') {
+            if (infoData.data.recommended.video && infoData.data.recommended.video.url) {
+                downloadUrl = infoData.data.recommended.video.url;
+                const ext = infoData.data.recommended.video.ext || 'mp4';
+                filename = `${infoData.data.title || videoId}_video.${ext}`;
+            } else {
+                throw new Error('No video format available');
+            }
+        } else { // combined
+            if (infoData.data.recommended.combined && infoData.data.recommended.combined.url) {
+                downloadUrl = infoData.data.recommended.combined.url;
+                const ext = infoData.data.recommended.combined.ext || 'mp4';
+                filename = `${infoData.data.title || videoId}.${ext}`;
+            } else {
+                throw new Error('No combined format available');
+            }
+        }
+        
+        if (!downloadUrl) {
+            throw new Error('Could not find a suitable download URL');
+        }
+        
+        // Clean filename
+        filename = filename.replace(/[<>:"/\\|?*]+/g, '_');
+        
+        // Set headers for file download
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+        
+        console.log(`[${requestId}] Redirecting to download URL for ${format} format`);
+        
+        // Redirect to the actual file for download
+        return res.redirect(302, downloadUrl);
+        
+    } catch (error) {
+        console.error(`[${requestId}] Download error:`, error);
+        res.status(500).json({
+            success: false,
+            error: `Download failed: ${error.message}`
+        });
+    }
+});
+
+// Update landing page to include info about new endpoints
 app.get('/', (req, res) => {
     res.send(`
         <html>
@@ -478,9 +731,12 @@ app.get('/', (req, res) => {
                 <style>
                     body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
                     h1 { color: #333; }
+                    h2 { margin-top: 30px; }
                     .container { max-width: 800px; margin: 0 auto; }
                     code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
                     .note { background: #fff8dc; padding: 10px; border-left: 4px solid #ffeb3b; }
+                    .endpoint { margin-bottom: 20px; background: #f8f9fa; padding: 15px; border-radius: 4px; }
+                    .method { font-weight: bold; color: #4285f4; }
                 </style>
             </head>
             <body>
@@ -488,8 +744,23 @@ app.get('/', (req, res) => {
                     <h1>Video Proxy Server</h1>
                     <p>This proxy server is running and ready to handle requests.</p>
                     
-                    <h2>Usage:</h2>
-                    <p>Send requests to <code>/proxy?url=YOUR_VIDEO_URL</code></p>
+                    <h2>Endpoints:</h2>
+                    
+                    <div class="endpoint">
+                        <p><span class="method">GET</span> <code>/proxy?url=YOUR_VIDEO_URL</code></p>
+                        <p>General-purpose proxy for fetching any URL (including media files).</p>
+                    </div>
+                    
+                    <div class="endpoint">
+                        <p><span class="method">GET</span> <code>/youtube-info?id=YOUTUBE_VIDEO_ID</code></p>
+                        <p>Fetches available video/audio formats for a YouTube video using ZM API.</p>
+                        <p>You can also use <code>/youtube-info?url=https://www.youtube.com/watch?v=VIDEOID</code></p>
+                    </div>
+                    
+                    <div class="endpoint">
+                        <p><span class="method">GET</span> <code>/download?id=YOUTUBE_VIDEO_ID&format=audio|video|combined</code></p>
+                        <p>Download YouTube video in specific format. Defaults to 'combined' if format not specified.</p>
+                    </div>
                     
                     <div class="note">
                         <p><strong>Note:</strong> Rate limiting is enabled. Maximum ${RATE_LIMIT_MAX} requests per IP address per ${RATE_LIMIT_WINDOW/1000} seconds.</p>
