@@ -8,6 +8,7 @@ const os = require('os');
 const { execSync } = require('child_process');
 const https = require('https');
 const http = require('http');
+const FormData = require('form-data'); // Add form-data package for multipart forms
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1930,3 +1931,320 @@ app.get('/test-proxy', async (req, res) => {
         });
     }
 });
+
+// Add transcribe endpoint that downloads audio and then transcribes it
+app.get('/transcribe', async (req, res) => {
+    const videoId = req.query.id;
+    const format = req.query.format || 'json'; // 'json', 'srt', or 'txt'
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    
+    if (!videoId) {
+        return res.status(400).json({ 
+            success: false,
+            error: 'חסר פרמטר חובה: id (מזהה סרטון)',
+            example: '/transcribe?id=YOUTUBE_VIDEO_ID&format=json|srt|txt'
+        });
+    }
+    
+    console.log(`[${requestId}] Transcription request for video ID: ${videoId}, format: ${format}`);
+    
+    try {
+        // 1. Get video information using youtube-info endpoint
+        const infoUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/youtube-info?id=${videoId}`;
+        console.log(`[${requestId}] Fetching video info from: ${infoUrl}`);
+        
+        const infoResponse = await fetch(infoUrl);
+        if (!infoResponse.ok) {
+            const errorText = await infoResponse.text();
+            throw new Error(`שגיאה בקבלת מידע על הסרטון: ${infoResponse.status}. ${errorText}`);
+        }
+        
+        const infoData = await infoResponse.json();
+        if (!infoData.success || !infoData.data) {
+            throw new Error('תגובה לא תקפה מנקודת הקצה של מידע הסרטון');
+        }
+        
+        console.log(`[${requestId}] Successfully got video info. Looking for best audio format...`);
+        
+        // 2. Find the best audio format for transcription
+        let audioUrl = null;
+        let formatInfo = null;
+        
+        // Prefer audio-only formats first
+        if (infoData.data.formats && infoData.data.formats.audio && infoData.data.formats.audio.length > 0) {
+            // Get the first audio format (usually best quality)
+            formatInfo = infoData.data.formats.audio[0];
+            audioUrl = formatInfo.url;
+            console.log(`[${requestId}] Selected audio-only format: ${formatInfo.quality || 'Unknown quality'}`);
+        } 
+        // Fallback to recommended audio
+        else if (infoData.data.recommended && infoData.data.recommended.audio) {
+            formatInfo = infoData.data.recommended.audio;
+            audioUrl = formatInfo.url;
+            console.log(`[${requestId}] Selected recommended audio format: ${formatInfo.quality || 'Unknown quality'}`);
+        }
+        // Fallback to combined format (will extract audio)
+        else if (infoData.data.recommended && infoData.data.recommended.combined) {
+            formatInfo = infoData.data.recommended.combined;
+            audioUrl = formatInfo.url;
+            console.log(`[${requestId}] No audio format found, using combined format: ${formatInfo.quality || 'Unknown quality'}`);
+        }
+        // Last resort: try any available format
+        else if (infoData.data.formats && infoData.data.formats.video && infoData.data.formats.video.length > 0) {
+            formatInfo = infoData.data.formats.video[0];
+            audioUrl = formatInfo.url;
+            console.log(`[${requestId}] No audio format found, using first available video format: ${formatInfo.quality || 'Unknown quality'}`);
+        }
+        
+        if (!audioUrl) {
+            throw new Error('לא נמצא פורמט אודיו מתאים לתמלול');
+        }
+        
+        console.log(`[${requestId}] Audio URL found, now downloading to server...`);
+        
+        // 3. Download the audio file to the server
+        const audioResponse = await fetch(audioUrl);
+        if (!audioResponse.ok) {
+            throw new Error(`שגיאה בהורדת קובץ האודיו: ${audioResponse.status} ${audioResponse.statusText}`);
+        }
+        
+        // Convert to buffer/blob
+        const audioBuffer = await audioResponse.arrayBuffer();
+        const audioBlob = Buffer.from(audioBuffer);
+        
+        // Save to a temporary file if needed
+        const tempFileName = path.join(TEMP_DIR, `${videoId}_${Date.now()}.mp3`);
+        fs.writeFileSync(tempFileName, audioBlob);
+        console.log(`[${requestId}] Audio saved to temporary file: ${tempFileName} (${audioBlob.length} bytes)`);
+        
+        // 4. Prepare the form data for ElevenLabs API
+        const formData = new FormData();
+        // For Node.js form-data, we need to use the file path 
+        formData.append('file', fs.createReadStream(tempFileName));
+        formData.append('model_id', 'scribe_v1'); // ElevenLabs model
+        formData.append('timestamps_granularity', 'word');
+        formData.append('language', ''); // Auto-detect language
+        
+        // 5. Send to ElevenLabs for transcription
+        console.log(`[${requestId}] Sending audio to ElevenLabs for transcription`);
+        
+        // Try ElevenLabs API with retries
+        let transcriptionData;
+        let apiRetries = 2; // Fewer retries for API to avoid excessive costs
+        let apiDelay = 2000; // Start with 2 seconds
+        let apiSuccess = false;
+        
+        for (let attempt = 1; attempt <= apiRetries + 1; attempt++) {
+            try {
+                console.log(`[${requestId}] ElevenLabs API attempt ${attempt}/${apiRetries + 1}`);
+                
+                const { response, data } = await sendMultipartFormRequest('https://api.elevenlabs.io/v1/speech-to-text', formData, {
+                    'xi-api-key': ELEVENLABS_API_KEY
+                });
+                
+                if (response.statusCode !== 200) {
+                    // Log the error in more detail
+                    console.error(`[${requestId}] ElevenLabs API error - status: ${response.statusCode}`);
+                    const errorText = typeof data === 'string' ? data : JSON.stringify(data);
+                    console.error(`[${requestId}] ElevenLabs error response: ${errorText}`);
+                    throw new Error(`ElevenLabs API error: ${response.statusCode} ${response.statusMessage}`);
+                }
+                
+                transcriptionData = data;
+                apiSuccess = true;
+                break; // Exit retry loop on success
+            } catch (apiError) {
+                console.error(`[${requestId}] ElevenLabs API attempt ${attempt} failed:`, apiError);
+                
+                if (attempt < apiRetries + 1) {
+                    console.log(`[${requestId}] Waiting ${apiDelay}ms before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, apiDelay));
+                    apiDelay *= 2; // Exponential backoff
+                } else {
+                    throw new Error(`כל נסיונות התמלול נכשלו: ${apiError.message}`);
+                }
+            }
+        }
+        
+        if (!apiSuccess || !transcriptionData) {
+            throw new Error('שגיאה בתמלול - לא התקבלו נתונים מ-ElevenLabs');
+        }
+        
+        console.log(`[${requestId}] Transcription successful, converting to requested format: ${format}`);
+        
+        // 6. Delete temporary file
+        try {
+            fs.unlinkSync(tempFileName);
+            console.log(`[${requestId}] Removed temporary file ${tempFileName}`);
+        } catch (deleteError) {
+            console.warn(`[${requestId}] Could not delete temporary file: ${deleteError.message}`);
+        }
+        
+        // 7. Process the transcription data based on the requested format
+        if (format === 'json') {
+            // Return raw JSON data from ElevenLabs
+            res.json({
+                success: true,
+                data: {
+                    videoId: videoId,
+                    title: infoData.data.title || '',
+                    duration: infoData.data.duration || 0,
+                    transcript: transcriptionData,
+                    language: transcriptionData.language || 'unknown'
+                }
+            });
+        } else if (format === 'srt') {
+            // Convert to SRT format
+            let srtContent = "";
+            let counter = 1;
+            
+            if (transcriptionData.words && Array.isArray(transcriptionData.words)) {
+                // Group words into sentences or smaller chunks
+                const chunks = [];
+                let currentChunk = [];
+                let currentDuration = 0;
+                const MAX_CHUNK_DURATION = 5; // Max 5 seconds per subtitle
+                
+                for (const word of transcriptionData.words) {
+                    currentChunk.push(word);
+                    currentDuration = word.end - (currentChunk[0]?.start || 0);
+                    
+                    // If chunk is long enough or we hit punctuation, create a new chunk
+                    if (currentDuration >= MAX_CHUNK_DURATION || 
+                        word.text.match(/[.!?]$/) || 
+                        currentChunk.length >= 15) {
+                        
+                        chunks.push([...currentChunk]);
+                        currentChunk = [];
+                        currentDuration = 0;
+                    }
+                }
+                
+                // Add any remaining words
+                if (currentChunk.length > 0) {
+                    chunks.push(currentChunk);
+                }
+                
+                // Convert chunks to SRT
+                for (const chunk of chunks) {
+                    if (chunk.length > 0) {
+                        const startTime = chunk[0].start;
+                        const endTime = chunk[chunk.length - 1].end;
+                        
+                        const startSrt = formatSrtTime(startTime);
+                        const endSrt = formatSrtTime(endTime);
+                        
+                        const text = chunk.map(w => w.text).join(' ')
+                            .replace(/ ([.,!?:;])/g, '$1'); // Fix spacing before punctuation
+                        
+                        srtContent += `${counter}\n`;
+                        srtContent += `${startSrt} --> ${endSrt}\n`;
+                        srtContent += `${text}\n\n`;
+                        
+                        counter++;
+                    }
+                }
+            }
+            
+            // Set content type to text and send SRT format
+            res.setHeader('Content-Type', 'text/plain');
+            res.setHeader('Content-Disposition', `attachment; filename="${videoId}.srt"`);
+            res.send(srtContent);
+        } else if (format === 'txt') {
+            // Convert to plain text format - just the text
+            let plainText = "";
+            
+            if (transcriptionData.text) {
+                // If ElevenLabs provides full text, use it
+                plainText = transcriptionData.text;
+            } else if (transcriptionData.words && Array.isArray(transcriptionData.words)) {
+                // Otherwise combine all words
+                plainText = transcriptionData.words.map(w => w.text).join(' ')
+                    .replace(/ ([.,!?:;])/g, '$1'); // Fix spacing before punctuation
+            }
+            
+            // Set content type to text and send TXT format
+            res.setHeader('Content-Type', 'text/plain');
+            res.setHeader('Content-Disposition', `attachment; filename="${videoId}.txt"`);
+            res.send(plainText);
+        } else {
+            throw new Error(`פורמט לא נתמך: ${format}. יש להשתמש ב-json, srt, או txt.`);
+        }
+        
+    } catch (error) {
+        console.error(`[${requestId}] Transcription error:`, error);
+        
+        // Return user-friendly error message
+        res.status(500).json({
+            success: false,
+            error: `שגיאה בתמלול: ${error.message}`,
+            requestId: requestId
+        });
+    }
+});
+
+// Helper function to format seconds to SRT time format (HH:MM:SS,mmm)
+function formatSrtTime(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    const millis = Math.floor((seconds % 1) * 1000);
+    
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
+}
+
+// Helper function to send multipart form request
+async function sendMultipartFormRequest(url, formData, headers = {}) {
+    return new Promise((resolve, reject) => {
+        // Get the form headers and add our custom headers
+        const formHeaders = formData.getHeaders();
+        const combinedHeaders = { ...formHeaders, ...headers };
+        
+        // Get the form data as a readable stream
+        const dataStream = formData;
+        
+        // Parse the URL
+        const parsedUrl = new URL(url);
+        
+        // Prepare the request options
+        const options = {
+            method: 'POST',
+            hostname: parsedUrl.hostname,
+            path: parsedUrl.pathname + parsedUrl.search,
+            headers: combinedHeaders
+        };
+        
+        // Choose http or https module based on the URL
+        const httpModule = parsedUrl.protocol === 'https:' ? https : http;
+        
+        // Make the request
+        const req = httpModule.request(options, (res) => {
+            const chunks = [];
+            
+            res.on('data', (chunk) => {
+                chunks.push(chunk);
+            });
+            
+            res.on('end', () => {
+                const responseBody = Buffer.concat(chunks).toString();
+                let data;
+                
+                // Try to parse as JSON if possible
+                try {
+                    data = JSON.parse(responseBody);
+                } catch (e) {
+                    data = responseBody; // Otherwise keep as string
+                }
+                
+                resolve({ response: res, data });
+            });
+        });
+        
+        req.on('error', (error) => {
+            reject(error);
+        });
+        
+        // Pipe the form data to the request
+        formData.pipe(req);
+    });
+}
