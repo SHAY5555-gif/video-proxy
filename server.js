@@ -2,6 +2,10 @@ const express = require('express');
 const fetch = require('node-fetch');
 const cors = require('cors');
 const { setTimeout } = require('timers/promises');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execSync } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,13 +15,35 @@ const requestCounts = {};
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 10; // 10 requests per minute per IP
 
-// Clear rate limit counts every minute
+// Add API key for ElevenLabs at the top of the file with other constants
+const ELEVENLABS_API_KEY = "sk_3cc5eba36a57dc0b8652796ce6c3a6f28277c977e93070da";
+
+// Create a temporary directory for audio files if it doesn't exist
+const TEMP_DIR = path.join(os.tmpdir(), 'youtube-proxy-audio');
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// Add cleanup function to periodically remove old temporary files
 setInterval(() => {
-    console.log('Clearing rate limit counts');
-    Object.keys(requestCounts).forEach(ip => {
-        requestCounts[ip] = 0;
-    });
-}, RATE_LIMIT_WINDOW);
+    try {
+        const currentTime = Date.now();
+        const files = fs.readdirSync(TEMP_DIR);
+        
+        for (const file of files) {
+            const filePath = path.join(TEMP_DIR, file);
+            const stats = fs.statSync(filePath);
+            
+            // Delete files older than 1 hour
+            if (currentTime - stats.mtimeMs > 60 * 60 * 1000) {
+                fs.unlinkSync(filePath);
+                console.log(`Deleted old temporary file: ${filePath}`);
+            }
+        }
+    } catch (err) {
+        console.error('Error cleaning up temporary files:', err);
+    }
+}, 15 * 60 * 1000); // Check every 15 minutes
 
 // Rate limiting middleware
 function rateLimiter(req, res, next) {
@@ -640,7 +666,7 @@ app.get('/youtube-info', async (req, res) => {
     }
 });
 
-// Improve the download endpoint with better error handling
+// Improve the download endpoint with better error handling and fallbacks
 app.get('/download', async (req, res) => {
     const videoId = req.query.id;
     const format = req.query.format || 'combined'; // 'video', 'audio', or 'combined'
@@ -676,66 +702,220 @@ app.get('/download', async (req, res) => {
             throw new Error('תגובה לא תקפה מנקודת הקצה של מידע הסרטון');
         }
         
-        // Select the appropriate format
+        // Function to validate a download URL before redirecting
+        const validateDownloadUrl = async (url, description) => {
+            try {
+                console.log(`[${requestId}] Validating download URL for ${description}...`);
+                
+                // Create options for HEAD request to validate URL
+                const options = {
+                    method: 'HEAD',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0',
+                        'Accept': '*/*',
+                        'Accept-Encoding': 'identity',
+                        'Connection': 'keep-alive',
+                        'Referer': 'https://www.youtube.com/'
+                    },
+                    timeout: 5000 // 5 second timeout for validation
+                };
+                
+                // For YouTube URLs, use our specialized fetch
+                const isYouTubeUrl = url.includes('googlevideo.com') || 
+                                    url.includes('youtube.com') || 
+                                    url.includes('youtu.be');
+                
+                // Try a HEAD request first for efficiency
+                const response = isYouTubeUrl 
+                    ? await fetchFromYouTube(url, options, 1) // Only one attempt for validation
+                    : await fetchWithRetries(url, options, 1);
+                
+                if (response.status >= 200 && response.status < 300) {
+                    console.log(`[${requestId}] URL validation successful for ${description}`);
+                    return { valid: true };
+                } else {
+                    console.warn(`[${requestId}] URL validation failed with status ${response.status} for ${description}`);
+                    return { 
+                        valid: false, 
+                        status: response.status,
+                        reason: `Invalid response status: ${response.status}`
+                    };
+                }
+            } catch (error) {
+                console.error(`[${requestId}] URL validation error for ${description}:`, error.message);
+                return { 
+                    valid: false, 
+                    reason: error.message
+                };
+            }
+        };
+        
+        // Try to find a working format with fallbacks
         let downloadUrl;
         let filename;
         let size = 'unknown';
         let qualityInfo = '';
+        let formatDescription = format;
+        let fallbackMessage = '';
         
-        if (format === 'audio') {
-            if (infoData.data.recommended && infoData.data.recommended.audio && infoData.data.recommended.audio.url) {
-                downloadUrl = infoData.data.recommended.audio.url;
-                const ext = infoData.data.recommended.audio.ext || 'mp3';
-                filename = `${infoData.data.title || videoId}_audio.${ext}`;
-                
-                if (infoData.data.recommended.audio.size) {
-                    size = formatFileSize(infoData.data.recommended.audio.size);
+        // Track all attempts to report to user
+        const attemptedFormats = [];
+        
+        // Attempt to get URL for the requested format
+        const tryFormat = async (formatType, formatIndex = 0) => {
+            const desc = formatType + (formatIndex > 0 ? ` (alternative ${formatIndex})` : '');
+            attemptedFormats.push(desc);
+            
+            console.log(`[${requestId}] Trying format: ${desc}`);
+            
+            let url = null;
+            let fmtInfo = null;
+            
+            // Attempt primary format first
+            if (formatIndex === 0) {
+                if (formatType === 'audio' && infoData.data.recommended && infoData.data.recommended.audio) {
+                    url = infoData.data.recommended.audio.url;
+                    fmtInfo = infoData.data.recommended.audio;
+                } else if (formatType === 'video' && infoData.data.recommended && infoData.data.recommended.video) {
+                    url = infoData.data.recommended.video.url;
+                    fmtInfo = infoData.data.recommended.video;
+                } else if (formatType === 'combined' && infoData.data.recommended && infoData.data.recommended.combined) {
+                    url = infoData.data.recommended.combined.url;
+                    fmtInfo = infoData.data.recommended.combined;
                 }
-                if (infoData.data.recommended.audio.quality) {
-                    qualityInfo = infoData.data.recommended.audio.quality;
+            } 
+            // Try alternative formats from the formats array
+            else {
+                if (formatType === 'audio' && infoData.data.formats && infoData.data.formats.audio) {
+                    // Skip the first one which is the recommended one we already tried
+                    const alternativeIndex = formatIndex - 1;
+                    if (alternativeIndex < infoData.data.formats.audio.length) {
+                        fmtInfo = infoData.data.formats.audio[alternativeIndex];
+                        url = fmtInfo.url;
+                    }
+                } else if (formatType === 'video' && infoData.data.formats && infoData.data.formats.video) {
+                    // Skip the first one which is the recommended one we already tried
+                    const alternativeIndex = formatIndex - 1;
+                    if (alternativeIndex < infoData.data.formats.video.length) {
+                        fmtInfo = infoData.data.formats.video[alternativeIndex];
+                        url = fmtInfo.url;
+                    }
                 }
-            } else {
-                console.error(`[${requestId}] No audio format available in data:`, infoData);
-                throw new Error('לא נמצא פורמט אודיו זמין לסרטון זה');
             }
-        } else if (format === 'video') {
-            if (infoData.data.recommended && infoData.data.recommended.video && infoData.data.recommended.video.url) {
-                downloadUrl = infoData.data.recommended.video.url;
-                const ext = infoData.data.recommended.video.ext || 'mp4';
-                filename = `${infoData.data.title || videoId}_video.${ext}`;
-                
-                if (infoData.data.recommended.video.size) {
-                    size = formatFileSize(infoData.data.recommended.video.size);
-                }
-                if (infoData.data.recommended.video.quality) {
-                    qualityInfo = infoData.data.recommended.video.quality;
-                }
-            } else {
-                console.error(`[${requestId}] No video format available in data:`, infoData);
-                throw new Error('לא נמצא פורמט וידאו זמין לסרטון זה');
+            
+            if (!url) {
+                console.log(`[${requestId}] No URL found for format: ${desc}`);
+                return null;
             }
-        } else { // combined
-            if (infoData.data.recommended && infoData.data.recommended.combined && infoData.data.recommended.combined.url) {
-                downloadUrl = infoData.data.recommended.combined.url;
-                const ext = infoData.data.recommended.combined.ext || 'mp4';
-                filename = `${infoData.data.title || videoId}.${ext}`;
+            
+            // Validate the URL before returning it
+            const validation = await validateDownloadUrl(url, desc);
+            if (validation.valid) {
+                return {
+                    url,
+                    formatInfo: fmtInfo,
+                    description: desc
+                };
+            }
+            
+            console.warn(`[${requestId}] Format ${desc} URL is invalid: ${validation.reason}`);
+            return null;
+        };
+        
+        // First try the explicitly requested format
+        let result = await tryFormat(format);
+        
+        // If the primary format fails, try alternatives
+        if (!result) {
+            console.log(`[${requestId}] Primary format '${format}' failed, trying alternatives...`);
+            fallbackMessage = `הפורמט המבוקש (${format}) לא היה זמין. `;
+            
+            // If the requested format is 'combined', try 'video' then 'audio'
+            if (format === 'combined') {
+                fallbackMessage += 'מנסה פורמט וידאו...';
+                result = await tryFormat('video');
                 
-                if (infoData.data.recommended.combined.size) {
-                    size = formatFileSize(infoData.data.recommended.combined.size);
+                if (!result) {
+                    fallbackMessage += ' מנסה פורמט אודיו בלבד...';
+                    result = await tryFormat('audio');
                 }
-                if (infoData.data.recommended.combined.quality) {
-                    qualityInfo = infoData.data.recommended.combined.quality;
+            } 
+            // If requested format is 'video', try alternatives from the formats.video array
+            else if (format === 'video') {
+                const videoFormatCount = infoData.data.formats && infoData.data.formats.video ? 
+                                        infoData.data.formats.video.length : 0;
+                
+                for (let i = 1; i <= Math.min(videoFormatCount, 3) && !result; i++) {
+                    fallbackMessage += ` מנסה פורמט וידאו חלופי ${i}...`;
+                    result = await tryFormat('video', i);
                 }
-            } else {
-                console.error(`[${requestId}] No combined format available in data:`, infoData);
-                throw new Error('לא נמצא פורמט משולב זמין לסרטון זה');
+                
+                // If all video formats fail, try combined then audio
+                if (!result) {
+                    fallbackMessage += ' מנסה פורמט משולב...';
+                    result = await tryFormat('combined');
+                    
+                    if (!result) {
+                        fallbackMessage += ' מנסה פורמט אודיו בלבד...';
+                        result = await tryFormat('audio');
+                    }
+                }
+            }
+            // If requested format is 'audio', try alternatives from the formats.audio array
+            else if (format === 'audio') {
+                const audioFormatCount = infoData.data.formats && infoData.data.formats.audio ? 
+                                        infoData.data.formats.audio.length : 0;
+                
+                for (let i = 1; i <= Math.min(audioFormatCount, 3) && !result; i++) {
+                    fallbackMessage += ` מנסה פורמט אודיו חלופי ${i}...`;
+                    result = await tryFormat('audio', i);
+                }
+                
+                // If all audio formats fail, try combined then video
+                if (!result) {
+                    fallbackMessage += ' מנסה פורמט משולב...';
+                    result = await tryFormat('combined');
+                    
+                    if (!result) {
+                        fallbackMessage += ' מנסה פורמט וידאו...';
+                        result = await tryFormat('video');
+                    }
+                }
             }
         }
         
-        if (!downloadUrl) {
-            console.error(`[${requestId}] Could not find a suitable download URL for format: ${format}`);
-            throw new Error(`לא נמצאה כתובת הורדה מתאימה עבור הפורמט: ${format}`);
+        // If we still don't have a valid URL, throw an error
+        if (!result) {
+            console.error(`[${requestId}] All format attempts failed. Attempted: ${attemptedFormats.join(', ')}`);
+            throw new Error(`כל נסיונות ההורדה נכשלו. ניסינו: ${attemptedFormats.join(', ')}`);
         }
+        
+        // We have a working URL, proceed with download
+        downloadUrl = result.url;
+        const formatInfo = result.formatInfo || {};
+        formatDescription = result.description;
+        
+        // Set up filename and other info
+        const ext = formatInfo.ext || (formatDescription.includes('audio') ? 'mp3' : 'mp4');
+        let filenameBase = infoData.data.title || videoId;
+        
+        // Add format suffix if using a fallback format
+        if (fallbackMessage) {
+            filenameBase += ` (${formatDescription})`;
+        }
+        
+        filename = `${filenameBase}.${ext}`;
+        
+        // Get size and quality info if available
+        if (formatInfo.size) {
+            size = formatFileSize(formatInfo.size);
+        }
+        if (formatInfo.quality) {
+            qualityInfo = formatInfo.quality;
+        }
+        
+        // Clean filename
+        filename = filename.replace(/[<>:"/\\|?*]+/g, '_');
         
         // Check if URL might be expired
         if (downloadUrl.includes('expire=')) {
@@ -760,13 +940,12 @@ app.get('/download', async (req, res) => {
             }
         }
         
-        // Clean filename
-        filename = filename.replace(/[<>:"/\\|?*]+/g, '_');
-        
         // Log download details
         console.log(`[${requestId}] Download details:
             Title: ${infoData.data.title || 'Unknown'}
-            Format: ${format}
+            Format requested: ${format}
+            Format used: ${formatDescription}
+            Fallback used: ${fallbackMessage ? 'Yes' : 'No'}
             Filename: ${filename}
             Size: ${size}
             Quality: ${qualityInfo}
@@ -774,14 +953,58 @@ app.get('/download', async (req, res) => {
             Expires: ${downloadUrl.includes('expire=') ? 'Yes (YouTube time-limited URL)' : 'No'}
         `);
         
-        // Set headers for file download
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+        // Set up client response
+        const htmlResponse = fallbackMessage ? `
+            <html>
+                <head>
+                    <title>הורדה מתחילה בעוד 3 שניות...</title>
+                    <meta charset="UTF-8">
+                    <meta http-equiv="refresh" content="3;url=${downloadUrl}">
+                    <style>
+                        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: #f0f0f0; text-align: center; direction: rtl; }
+                        .container { max-width: 700px; margin: 100px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                        h1 { color: #c00; margin-top: 0; }
+                        .success-icon { font-size: 48px; color: #4CAF50; margin-bottom: 20px; }
+                        .download-btn { display: inline-block; margin-top: 20px; padding: 12px 25px; background: #c00; color: white; text-decoration: none; border-radius: 4px; font-size: 16px; }
+                        .download-btn:hover { background: #900; }
+                        .info { background: #e8f5e9; padding: 15px; border-radius: 4px; margin: 20px 0; text-align: right; }
+                        .progress { height: 5px; background: #f0f0f0; border-radius: 5px; margin: 20px 0; overflow: hidden; }
+                        .progress-bar { height: 100%; width: 0; background: #c00; animation: progress 3s linear forwards; }
+                        @keyframes progress { to { width: 100%; } }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="success-icon">✓</div>
+                        <h1>הורדה מתחילה בעוד 3 שניות...</h1>
+                        <div class="progress"><div class="progress-bar"></div></div>
+                        <div class="info">
+                            <p><strong>הפורמט המקורי לא היה זמין.</strong> ${fallbackMessage}</p>
+                            <p><strong>משתמש בפורמט:</strong> ${formatDescription}</p>
+                            <p><strong>שם קובץ:</strong> ${filename}</p>
+                            <p><strong>גודל:</strong> ${size}</p>
+                            <p><strong>איכות:</strong> ${qualityInfo || 'לא צוין'}</p>
+                        </div>
+                        <p>אם ההורדה לא מתחילה אוטומטית, לחץ על הכפתור:</p>
+                        <a href="${downloadUrl}" class="download-btn">התחל הורדה</a>
+                    </div>
+                    <script>
+                        setTimeout(function() {
+                            window.location.href = "${downloadUrl}";
+                        }, 3000);
+                    </script>
+                </body>
+            </html>
+        ` : null;
         
-        console.log(`[${requestId}] Redirecting to download URL for ${format} format`);
-        
-        // Redirect to the actual file for download
-        return res.redirect(302, downloadUrl);
-        
+        // If using a fallback format, show info page with auto-redirect
+        if (htmlResponse) {
+            res.send(htmlResponse);
+        } else {
+            // Otherwise, regular download with Content-Disposition header
+            res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+            res.redirect(302, downloadUrl);
+        }
     } catch (error) {
         console.error(`[${requestId}] Download error:`, error);
         
@@ -797,6 +1020,8 @@ app.get('/download', async (req, res) => {
                         h1 { color: #c00; margin-top: 0; }
                         .back-btn { display: inline-block; margin-top: 20px; padding: 10px 20px; background: #c00; color: white; text-decoration: none; border-radius: 4px; }
                         .back-btn:hover { background: #900; }
+                        .retry-btn { display: inline-block; margin-top: 20px; margin-right: 10px; padding: 10px 20px; background: #2196F3; color: white; text-decoration: none; border-radius: 4px; }
+                        .retry-btn:hover { background: #0b7dda; }
                         .error-details { background: #ffe6e6; padding: 15px; border-radius: 4px; margin-top: 20px; }
                         code { background: #f8f8f8; padding: 2px 5px; border-radius: 3px; font-family: monospace; direction: ltr; display: inline-block; }
                     </style>
@@ -813,6 +1038,10 @@ app.get('/download', async (req, res) => {
                             <p><strong>זמן השגיאה:</strong> ${new Date().toLocaleString('he-IL')}</p>
                         </div>
                         
+                        <p>אפשר לנסות שוב עם פורמט אחר:</p>
+                        <a href="/download?id=${videoId}&format=${format === 'audio' ? 'video' : 'audio'}" class="retry-btn">
+                            נסה ב${format === 'audio' ? 'וידאו' : 'אודיו בלבד'}
+                        </a>
                         <a href="/" class="back-btn">חזרה לדף הראשי</a>
                     </div>
                 </body>
@@ -834,7 +1063,16 @@ function formatFileSize(bytes) {
     return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + sizes[i];
 }
 
-// Update landing page to include a user-friendly form
+// Fix missing rate limit cleanup function that was accidentally removed
+// Clear rate limit counts every minute
+setInterval(() => {
+    console.log('Clearing rate limit counts');
+    Object.keys(requestCounts).forEach(ip => {
+        requestCounts[ip] = 0;
+    });
+}, RATE_LIMIT_WINDOW);
+
+// Update the main page HTML to add a transcription option
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -842,7 +1080,7 @@ app.get('/', (req, res) => {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>YouTube Downloader</title>
+                <title>YouTube Downloader & Transcriber</title>
                 <style>
                     :root {
                         --primary-color: #c00;
@@ -879,6 +1117,51 @@ app.get('/', (req, res) => {
                         max-width: 800px;
                         margin: 0 auto;
                         padding: 0 1rem;
+                    }
+                    
+                    .tab-container {
+                        margin-bottom: 1rem;
+                    }
+                    
+                    .tab-buttons {
+                        display: flex;
+                        border-bottom: 1px solid #ddd;
+                        margin-bottom: 20px;
+                    }
+                    
+                    .tab-button {
+                        background-color: #f1f1f1;
+                        border: none;
+                        outline: none;
+                        cursor: pointer;
+                        padding: 12px 20px;
+                        transition: background-color 0.3s;
+                        font-weight: 600;
+                        border-radius: 6px 6px 0 0;
+                        margin-left: 5px;
+                    }
+                    
+                    .tab-button:hover {
+                        background-color: #ddd;
+                    }
+                    
+                    .tab-button.active {
+                        background-color: var(--primary-color);
+                        color: white;
+                    }
+                    
+                    .tab-content {
+                        display: none;
+                        animation: fadeIn 0.5s;
+                    }
+                    
+                    .tab-content.active {
+                        display: block;
+                    }
+                    
+                    @keyframes fadeIn {
+                        from { opacity: 0; }
+                        to { opacity: 1; }
                     }
                     
                     .download-card {
@@ -1036,6 +1319,57 @@ app.get('/', (req, res) => {
                         100% { transform: rotate(360deg); }
                     }
                     
+                    .format-buttons {
+                        display: flex;
+                        gap: 10px;
+                        margin-top: 20px;
+                    }
+                    
+                    .format-button {
+                        background-color: #2196F3;
+                        color: white;
+                        border: none;
+                        padding: 8px 15px;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-size: 0.9rem;
+                        transition: background-color 0.2s;
+                    }
+                    
+                    .format-button:hover {
+                        background-color: #0b7dda;
+                    }
+                    
+                    .format-button.srt {
+                        background-color: #4CAF50;
+                    }
+                    
+                    .format-button.srt:hover {
+                        background-color: #3e8e41;
+                    }
+                    
+                    .format-button.txt {
+                        background-color: #ff9800;
+                    }
+                    
+                    .format-button.txt:hover {
+                        background-color: #e68a00;
+                    }
+                    
+                    .transcript-preview {
+                        display: none;
+                        margin-top: 20px;
+                        background: #f8f8f8;
+                        padding: 15px;
+                        border-radius: 5px;
+                        max-height: 200px;
+                        overflow-y: auto;
+                        font-family: Arial, sans-serif;
+                        white-space: pre-wrap;
+                        direction: ltr;
+                        text-align: left;
+                    }
+                    
                     /* Responsive adjustments */
                     @media (max-width: 600px) {
                         .header h1 {
@@ -1046,62 +1380,140 @@ app.get('/', (req, res) => {
                             flex-direction: column;
                             gap: 0.5rem;
                         }
+                        
+                        .tab-buttons {
+                            flex-direction: column;
+                        }
+                        
+                        .tab-button {
+                            border-radius: 0;
+                            margin-left: 0;
+                            margin-bottom: 2px;
+                        }
                     }
                 </style>
             </head>
             <body>
                 <div class="header">
-                    <h1>YouTube Downloader</h1>
+                    <h1>YouTube Downloader & Transcriber</h1>
                 </div>
                 
                 <div class="container">
-                    <div class="download-card">
-                        <form id="download-form" action="/process" method="GET">
-                            <div class="form-group">
-                                <label for="url">הדבק כתובת סרטון YouTube:</label>
-                                <input type="text" id="url" name="url" class="input-url" 
-                                    placeholder="https://www.youtube.com/watch?v=..." required 
-                                    dir="ltr">
-                            </div>
-                            
-                            <div class="form-group">
-                                <label>בחר פורמט להורדה:</label>
-                                <div class="radio-group">
-                                    <label class="radio-option">
-                                        <input type="radio" name="format" value="audio" checked>
-                                        אודיו בלבד (MP3)
-                                    </label>
-                                    <label class="radio-option">
-                                        <input type="radio" name="format" value="video">
-                                        וידאו איכות גבוהה (MP4)
-                                    </label>
-                                    <label class="radio-option">
-                                        <input type="radio" name="format" value="combined">
-                                        וידאו + אודיו (MP4)
-                                    </label>
-                                </div>
-                            </div>
-                            
-                            <button type="submit" class="submit-btn">הורד עכשיו</button>
-                        </form>
-                        
-                        <div class="error-message" id="error-box"></div>
-                        
-                        <div class="loading" id="loading">
-                            <div class="spinner"></div>
-                            <p>מאתר פורמטים זמינים...</p>
+                    <div class="tab-container">
+                        <div class="tab-buttons">
+                            <button class="tab-button active" data-tab="download">הורדת וידאו</button>
+                            <button class="tab-button" data-tab="transcribe">תמלול אודיו</button>
                         </div>
                         
-                        <div class="preview" id="preview">
-                            <h3>פרטי הסרטון:</h3>
-                            <div class="video-info">
-                                <img id="thumbnail" class="thumbnail" src="" alt="תמונה ממוזערת">
-                                <div>
-                                    <h4 id="video-title"></h4>
-                                    <p id="video-duration"></p>
+                        <div class="tab-content active" id="download-tab">
+                            <div class="download-card">
+                                <form id="download-form" action="/process" method="GET">
+                                    <div class="form-group">
+                                        <label for="download-url">הדבק כתובת סרטון YouTube:</label>
+                                        <input type="text" id="download-url" name="url" class="input-url" 
+                                            placeholder="https://www.youtube.com/watch?v=..." required 
+                                            dir="ltr">
+                                    </div>
+                                    
+                                    <div class="form-group">
+                                        <label>בחר פורמט להורדה:</label>
+                                        <div class="radio-group">
+                                            <label class="radio-option">
+                                                <input type="radio" name="format" value="audio" checked>
+                                                אודיו בלבד (MP3)
+                                            </label>
+                                            <label class="radio-option">
+                                                <input type="radio" name="format" value="video">
+                                                וידאו איכות גבוהה (MP4)
+                                            </label>
+                                            <label class="radio-option">
+                                                <input type="radio" name="format" value="combined">
+                                                וידאו + אודיו (MP4)
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <button type="submit" class="submit-btn">הורד עכשיו</button>
+                                </form>
+                                
+                                <div class="error-message" id="download-error-box"></div>
+                                
+                                <div class="loading" id="download-loading">
+                                    <div class="spinner"></div>
+                                    <p>מאתר פורמטים זמינים...</p>
+                                </div>
+                                
+                                <div class="preview" id="download-preview">
+                                    <h3>פרטי הסרטון:</h3>
+                                    <div class="video-info">
+                                        <img id="download-thumbnail" class="thumbnail" src="" alt="תמונה ממוזערת">
+                                        <div>
+                                            <h4 id="download-video-title"></h4>
+                                            <p id="download-video-duration"></p>
+                                        </div>
+                                    </div>
+                                    <a id="download-btn" class="submit-btn">התחל הורדה</a>
                                 </div>
                             </div>
-                            <a id="download-btn" class="submit-btn">התחל הורדה</a>
+                        </div>
+                        
+                        <div class="tab-content" id="transcribe-tab">
+                            <div class="download-card">
+                                <form id="transcribe-form">
+                                    <div class="form-group">
+                                        <label for="transcribe-url">הדבק כתובת סרטון YouTube לתמלול:</label>
+                                        <input type="text" id="transcribe-url" name="url" class="input-url" 
+                                            placeholder="https://www.youtube.com/watch?v=..." required 
+                                            dir="ltr">
+                                    </div>
+                                    
+                                    <div class="form-group">
+                                        <label>בחר פורמט לתמלול:</label>
+                                        <div class="radio-group">
+                                            <label class="radio-option">
+                                                <input type="radio" name="transcribe-format" value="json" checked>
+                                                JSON (כולל חותמות זמן)
+                                            </label>
+                                            <label class="radio-option">
+                                                <input type="radio" name="transcribe-format" value="srt">
+                                                SRT (כתוביות)
+                                            </label>
+                                            <label class="radio-option">
+                                                <input type="radio" name="transcribe-format" value="txt">
+                                                טקסט בלבד (TXT)
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <button type="submit" class="submit-btn">תמלל עכשיו</button>
+                                </form>
+                                
+                                <div class="error-message" id="transcribe-error-box"></div>
+                                
+                                <div class="loading" id="transcribe-loading">
+                                    <div class="spinner"></div>
+                                    <p>מבצע תמלול... תהליך זה עשוי להימשך מספר דקות</p>
+                                </div>
+                                
+                                <div class="preview" id="transcribe-preview">
+                                    <h3>תוצאות התמלול:</h3>
+                                    <div class="video-info">
+                                        <img id="transcribe-thumbnail" class="thumbnail" src="" alt="תמונה ממוזערת">
+                                        <div>
+                                            <h4 id="transcribe-video-title"></h4>
+                                            <p id="transcribe-video-duration"></p>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="format-buttons">
+                                        <a id="transcribe-json-btn" href="#" class="format-button json">הורד JSON</a>
+                                        <a id="transcribe-srt-btn" href="#" class="format-button srt">הורד SRT</a>
+                                        <a id="transcribe-txt-btn" href="#" class="format-button txt">הורד טקסט</a>
+                                    </div>
+                                    
+                                    <div class="transcript-preview" id="transcript-text"></div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                     
@@ -1122,39 +1534,66 @@ app.get('/', (req, res) => {
                         
                         <div class="endpoint">
                             <span class="method">GET</span>
+                            <code>/transcribe?id=YOUTUBE_VIDEO_ID&format=json|srt|txt</code>
+                            <p>מתמלל סרטון YouTube ומחזיר את התמלול בפורמט המבוקש.</p>
+                        </div>
+                        
+                        <div class="endpoint">
+                            <span class="method">GET</span>
                             <code>/proxy?url=URL</code>
                             <p>פרוקסי כללי להורדת קבצים.</p>
                         </div>
                     </div>
                     
                     <div class="note">
-                        <p><strong>הערה:</strong> הגבלת קצב בתוקף. מקסימום ${RATE_LIMIT_MAX} בקשות לכל כתובת IP בכל ${RATE_LIMIT_WINDOW/1000} שניות.</p>
-                        <p>שרת זה נועד למטרות לימודיות בלבד.</p>
+                        <p><strong>הערות:</strong></p>
+                        <p>1. הגבלת קצב בתוקף. מקסימום ${RATE_LIMIT_MAX} בקשות לכל כתובת IP בכל ${RATE_LIMIT_WINDOW/1000} שניות.</p>
+                        <p>2. תמלול עשוי להימשך מספר דקות, בהתאם לאורך הסרטון.</p>
+                        <p>3. שרת זה נועד למטרות לימודיות בלבד.</p>
                     </div>
                 </div>
                 
                 <script>
                     document.addEventListener('DOMContentLoaded', function() {
-                        const form = document.getElementById('download-form');
-                        const urlInput = document.getElementById('url');
-                        const errorBox = document.getElementById('error-box');
-                        const loading = document.getElementById('loading');
-                        const preview = document.getElementById('preview');
-                        const thumbnail = document.getElementById('thumbnail');
-                        const videoTitle = document.getElementById('video-title');
-                        const videoDuration = document.getElementById('video-duration');
+                        // Tab switching functionality
+                        const tabButtons = document.querySelectorAll('.tab-button');
+                        const tabContents = document.querySelectorAll('.tab-content');
+                        
+                        tabButtons.forEach(button => {
+                            button.addEventListener('click', function() {
+                                const tabId = this.getAttribute('data-tab');
+                                
+                                // Deactivate all tabs
+                                tabButtons.forEach(btn => btn.classList.remove('active'));
+                                tabContents.forEach(content => content.classList.remove('active'));
+                                
+                                // Activate the clicked tab
+                                this.classList.add('active');
+                                document.getElementById(tabId + '-tab').classList.add('active');
+                            });
+                        });
+                        
+                        // Download form functionality (similar to existing code)
+                        const downloadForm = document.getElementById('download-form');
+                        const downloadUrlInput = document.getElementById('download-url');
+                        const downloadErrorBox = document.getElementById('download-error-box');
+                        const downloadLoading = document.getElementById('download-loading');
+                        const downloadPreview = document.getElementById('download-preview');
+                        const downloadThumbnail = document.getElementById('download-thumbnail');
+                        const downloadVideoTitle = document.getElementById('download-video-title');
+                        const downloadVideoDuration = document.getElementById('download-video-duration');
                         const downloadBtn = document.getElementById('download-btn');
                         
-                        form.addEventListener('submit', async function(e) {
+                        downloadForm.addEventListener('submit', async function(e) {
                             e.preventDefault();
                             
                             // Hide any previous errors and preview
-                            errorBox.style.display = 'none';
-                            preview.classList.remove('active');
+                            downloadErrorBox.style.display = 'none';
+                            downloadPreview.classList.remove('active');
                             
-                            const url = urlInput.value.trim();
+                            const url = downloadUrlInput.value.trim();
                             if (!url) {
-                                showError('נא להזין כתובת YouTube תקפה');
+                                showError(downloadErrorBox, 'נא להזין כתובת YouTube תקפה');
                                 return;
                             }
                             
@@ -1163,17 +1602,17 @@ app.get('/', (req, res) => {
                             try {
                                 videoId = extractVideoId(url);
                             } catch (error) {
-                                showError(error.message);
+                                showError(downloadErrorBox, error.message);
                                 return;
                             }
                             
                             if (!videoId) {
-                                showError('לא ניתן לחלץ את מזהה הסרטון מהכתובת. נא לוודא שזוהי כתובת YouTube תקפה.');
+                                showError(downloadErrorBox, 'לא ניתן לחלץ את מזהה הסרטון מהכתובת. נא לוודא שזוהי כתובת YouTube תקפה.');
                                 return;
                             }
                             
                             // Show loading indicator
-                            loading.style.display = 'block';
+                            downloadLoading.style.display = 'block';
                             
                             try {
                                 // Get video info
@@ -1188,41 +1627,196 @@ app.get('/', (req, res) => {
                                 }
                                 
                                 // Hide loading and show preview
-                                loading.style.display = 'none';
+                                downloadLoading.style.display = 'none';
                                 
                                 // Update preview with video info
-                                thumbnail.src = data.data.thumbnail || 'https://via.placeholder.com/120x68.png?text=No+Thumbnail';
-                                videoTitle.textContent = data.data.title || 'סרטון ללא כותרת';
+                                downloadThumbnail.src = data.data.thumbnail || 'https://via.placeholder.com/120x68.png?text=No+Thumbnail';
+                                downloadVideoTitle.textContent = data.data.title || 'סרטון ללא כותרת';
                                 
                                 // Format duration in seconds to MM:SS
                                 const durationSeconds = data.data.duration || 0;
                                 const minutes = Math.floor(durationSeconds / 60);
                                 const seconds = Math.floor(durationSeconds % 60);
-                                videoDuration.textContent = \`אורך: \${minutes}:\${seconds < 10 ? '0' : ''}\${seconds}\`;
+                                downloadVideoDuration.textContent = \`אורך: \${minutes}:\${seconds < 10 ? '0' : ''}\${seconds}\`;
                                 
                                 // Update download button
                                 const format = document.querySelector('input[name="format"]:checked').value;
                                 downloadBtn.href = \`/download?id=\${videoId}&format=\${format}\`;
                                 
                                 // Show preview
-                                preview.classList.add('active');
+                                downloadPreview.classList.add('active');
                                 
                             } catch (error) {
-                                loading.style.display = 'none';
-                                showError(error.message);
+                                downloadLoading.style.display = 'none';
+                                showError(downloadErrorBox, error.message);
                             }
                         });
                         
                         // Update download link when format changes
                         document.querySelectorAll('input[name="format"]').forEach(radio => {
                             radio.addEventListener('change', function() {
-                                if (preview.classList.contains('active')) {
-                                    const videoId = extractVideoId(urlInput.value);
+                                if (downloadPreview.classList.contains('active')) {
+                                    const videoId = extractVideoId(downloadUrlInput.value);
                                     const format = document.querySelector('input[name="format"]:checked').value;
                                     downloadBtn.href = \`/download?id=\${videoId}&format=\${format}\`;
                                 }
                             });
                         });
+                        
+                        // Transcribe form functionality
+                        const transcribeForm = document.getElementById('transcribe-form');
+                        const transcribeUrlInput = document.getElementById('transcribe-url');
+                        const transcribeErrorBox = document.getElementById('transcribe-error-box');
+                        const transcribeLoading = document.getElementById('transcribe-loading');
+                        const transcribePreview = document.getElementById('transcribe-preview');
+                        const transcribeThumbnail = document.getElementById('transcribe-thumbnail');
+                        const transcribeVideoTitle = document.getElementById('transcribe-video-title');
+                        const transcribeVideoDuration = document.getElementById('transcribe-video-duration');
+                        const jsonBtn = document.getElementById('transcribe-json-btn');
+                        const srtBtn = document.getElementById('transcribe-srt-btn');
+                        const txtBtn = document.getElementById('transcribe-txt-btn');
+                        const transcriptText = document.getElementById('transcript-text');
+                        
+                        transcribeForm.addEventListener('submit', async function(e) {
+                            e.preventDefault();
+                            
+                            // Hide any previous errors and preview
+                            transcribeErrorBox.style.display = 'none';
+                            transcribePreview.classList.remove('active');
+                            transcriptText.style.display = 'none';
+                            
+                            const url = transcribeUrlInput.value.trim();
+                            if (!url) {
+                                showError(transcribeErrorBox, 'נא להזין כתובת YouTube תקפה');
+                                return;
+                            }
+                            
+                            // Extract video ID from URL
+                            let videoId;
+                            try {
+                                videoId = extractVideoId(url);
+                            } catch (error) {
+                                showError(transcribeErrorBox, error.message);
+                                return;
+                            }
+                            
+                            if (!videoId) {
+                                showError(transcribeErrorBox, 'לא ניתן לחלץ את מזהה הסרטון מהכתובת. נא לוודא שזוהי כתובת YouTube תקפה.');
+                                return;
+                            }
+                            
+                            // Show loading indicator
+                            transcribeLoading.style.display = 'block';
+                            
+                            try {
+                                // First get video info for metadata
+                                const infoResponse = await fetch(\`/youtube-info?id=\${videoId}\`);
+                                if (!infoResponse.ok) {
+                                    throw new Error(\`שגיאה בקבלת מידע על הסרטון: \${infoResponse.status} \${infoResponse.statusText}\`);
+                                }
+                                
+                                const infoData = await infoResponse.json();
+                                if (!infoData.success) {
+                                    throw new Error(infoData.error || 'שגיאה לא ידועה בקבלת מידע על הסרטון');
+                                }
+                                
+                                // Get selected format
+                                const format = document.querySelector('input[name="transcribe-format"]:checked').value;
+                                
+                                // Call transcribe endpoint
+                                const transcribeResponse = await fetch(\`/transcribe?id=\${videoId}&format=\${format}\`);
+                                
+                                if (!transcribeResponse.ok) {
+                                    let errorMessage = \`שגיאה בתמלול: \${transcribeResponse.status} \${transcribeResponse.statusText}\`;
+                                    try {
+                                        const errorData = await transcribeResponse.json();
+                                        if (errorData.error) {
+                                            errorMessage = errorData.error;
+                                        }
+                                    } catch (e) {
+                                        // If we can't parse the error, use the default message
+                                    }
+                                    throw new Error(errorMessage);
+                                }
+                                
+                                // For txt and srt formats, we get back the raw content
+                                if (format === 'txt' || format === 'srt') {
+                                    const textData = await transcribeResponse.text();
+                                    
+                                    // Hide loading and show preview
+                                    transcribeLoading.style.display = 'none';
+                                    
+                                    // Update preview with video info
+                                    transcribeThumbnail.src = infoData.data.thumbnail || 'https://via.placeholder.com/120x68.png?text=No+Thumbnail';
+                                    transcribeVideoTitle.textContent = infoData.data.title || 'סרטון ללא כותרת';
+                                    
+                                    // Format duration in seconds to MM:SS
+                                    const durationSeconds = infoData.data.duration || 0;
+                                    const minutes = Math.floor(durationSeconds / 60);
+                                    const seconds = Math.floor(durationSeconds % 60);
+                                    transcribeVideoDuration.textContent = \`אורך: \${minutes}:\${seconds < 10 ? '0' : ''}\${seconds}\`;
+                                    
+                                    // Show transcript preview
+                                    transcriptText.textContent = textData.substring(0, 500) + (textData.length > 500 ? '...' : '');
+                                    transcriptText.style.display = 'block';
+                                    
+                                    // Update download buttons
+                                    jsonBtn.href = \`/transcribe?id=\${videoId}&format=json\`;
+                                    srtBtn.href = \`/transcribe?id=\${videoId}&format=srt\`;
+                                    txtBtn.href = \`/transcribe?id=\${videoId}&format=txt\`;
+                                    
+                                    // Show preview
+                                    transcribePreview.classList.add('active');
+                                } else {
+                                    // For JSON format, we get back a JSON object
+                                    const jsonData = await transcribeResponse.json();
+                                    
+                                    if (!jsonData.success) {
+                                        throw new Error(jsonData.error || 'שגיאה לא ידועה בתמלול');
+                                    }
+                                    
+                                    // Hide loading and show preview
+                                    transcribeLoading.style.display = 'none';
+                                    
+                                    // Check if we have the traditional format (format=json) or the all format (format=all)
+                                    const transcriptData = jsonData.data.formats ? jsonData.data.formats.txt : jsonData.data.transcript.text;
+                                    
+                                    // Update preview with video info
+                                    transcribeThumbnail.src = infoData.data.thumbnail || 'https://via.placeholder.com/120x68.png?text=No+Thumbnail';
+                                    transcribeVideoTitle.textContent = infoData.data.title || 'סרטון ללא כותרת';
+                                    
+                                    // Format duration in seconds to MM:SS
+                                    const durationSeconds = infoData.data.duration || 0;
+                                    const minutes = Math.floor(durationSeconds / 60);
+                                    const seconds = Math.floor(durationSeconds % 60);
+                                    transcribeVideoDuration.textContent = \`אורך: \${minutes}:\${seconds < 10 ? '0' : ''}\${seconds}\`;
+                                    
+                                    // Show transcript preview
+                                    transcriptText.textContent = typeof transcriptData === 'string' ? 
+                                        (transcriptData.substring(0, 500) + (transcriptData.length > 500 ? '...' : '')) : 
+                                        'תמלול התקבל בהצלחה. לחץ על אחד מהכפתורים למטה כדי להוריד את התמלול בפורמט הרצוי.';
+                                    transcriptText.style.display = 'block';
+                                    
+                                    // Update download buttons
+                                    jsonBtn.href = \`/transcribe?id=\${videoId}&format=json\`;
+                                    srtBtn.href = \`/transcribe?id=\${videoId}&format=srt\`;
+                                    txtBtn.href = \`/transcribe?id=\${videoId}&format=txt\`;
+                                    
+                                    // Show preview
+                                    transcribePreview.classList.add('active');
+                                }
+                                
+                            } catch (error) {
+                                transcribeLoading.style.display = 'none';
+                                showError(transcribeErrorBox, error.message);
+                            }
+                        });
+                        
+                        // Helper function to show error messages
+                        function showError(errorElement, message) {
+                            errorElement.textContent = message;
+                            errorElement.style.display = 'block';
+                        }
                         
                         // Extract video ID from various YouTube URL formats
                         function extractVideoId(url) {
@@ -1261,11 +1855,6 @@ app.get('/', (req, res) => {
                             }
                             
                             return videoId;
-                        }
-                        
-                        function showError(message) {
-                            errorBox.textContent = message;
-                            errorBox.style.display = 'block';
                         }
                     });
                 </script>
@@ -1412,6 +2001,361 @@ app.get('/youtube-info-by-url', async (req, res) => {
         });
     }
 });
+
+// Helper function to convert words from ElevenLabs to SRT
+function convertWordsToSrt(words) {
+    if (!words || words.length === 0) return '';
+
+    let srt = '';
+    let lineIndex = 1;
+    let currentLineWords = []; // Store word objects for the current line
+    let lineStartTime = -1;
+
+    // Helper function to format time in SRT format (HH:MM:SS,ms)
+    function formatTime(seconds) {
+        const date = new Date(0);
+        date.setSeconds(seconds);
+        const timeStr = date.toISOString().substr(11, 12);
+        return timeStr.replace('.', ',');
+    }
+
+    // Helper function to check if a word ends with required punctuation
+    function endsWithPunctuation(wordText) {
+        const trimmedText = wordText.trim();
+        // Updated regex to include Chinese punctuation: 。？！
+        return /[.?!。？！]$/.test(trimmedText);
+    }
+
+    // Helper function to finalize and add a line to the SRT string
+    function finalizeLine() {
+        if (currentLineWords.length === 0) return;
+
+        const lineText = currentLineWords.map(w => w.text).join(' ').trim();
+        const lineEndTime = currentLineWords[currentLineWords.length - 1].end;
+
+        srt += `${lineIndex}\n`;
+        srt += `${formatTime(lineStartTime)} --> ${formatTime(lineEndTime)}\n`;
+        srt += `${lineText}\n\n`;
+
+        lineIndex++;
+        currentLineWords = []; // Reset for the next line
+        lineStartTime = -1;
+    }
+
+    for (let i = 0; i < words.length; i++) {
+        const word = words[i];
+
+        // Skip non-word types or empty words
+        if (word.type !== 'word' || !word.text.trim()) continue;
+
+        // Start of a new line
+        if (lineStartTime === -1) {
+            lineStartTime = word.start;
+        }
+
+        // Add the word to the current line buffer
+        currentLineWords.push(word);
+
+        // Check conditions for finalizing the line:
+        // 1. Current word ends with punctuation AND we have at least 5 words.
+        // 2. It's the very last word in the input array.
+        const isPunctuationEnd = endsWithPunctuation(word.text);
+        const hasEnoughWords = currentLineWords.length >= 5;
+        const isLastWord = (i === words.length - 1);
+
+        if ((isPunctuationEnd && hasEnoughWords) || isLastWord) {
+            finalizeLine();
+        }
+        // If it ends with punctuation but not enough words, we just continue accumulating
+    }
+
+    // Ensure any remaining words are added if the loop finishes without finalizing
+    if (currentLineWords.length > 0) {
+        finalizeLine();
+    }
+
+    return srt;
+}
+
+// Helper function to convert words to plain text
+function convertWordsToPlainText(words) {
+    if (!words || words.length === 0) return '';
+    
+    // Just extract the text from each word object and join them
+    return words
+        .filter(word => word.type === 'word' && word.text.trim())
+        .map(word => word.text)
+        .join(' ')
+        .trim()
+        // Fix common spacing issues around punctuation
+        .replace(/ ([,.!?;:])(?= |$)/g, '$1')
+        // Fix spacing for closing quotes/parentheses
+        .replace(/ (["\)\]\}])/g, '$1')
+        // Fix spacing for opening quotes/parentheses
+        .replace(/(["\(\[\{]) /g, '$1');
+}
+
+// Add a new endpoint for transcription
+app.get('/transcribe', async (req, res) => {
+    const videoId = req.query.id;
+    const videoUrl = req.query.url;
+    const format = req.query.format || 'all'; // 'json', 'srt', 'txt', or 'all'
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    
+    // We need either video ID or full URL
+    if (!videoId && !videoUrl) {
+        return res.status(400).json({ 
+            success: false,
+            error: 'חסר פרמטר חובה: id או url',
+            example: '/transcribe?id=YOUTUBE_VIDEO_ID או /transcribe?url=https://www.youtube.com/watch?v=VIDEOID'
+        });
+    }
+    
+    try {
+        console.log(`[${requestId}] Starting transcription process for video ID: ${videoId || 'from URL'}`);
+        
+        // Step 1: Get video information to find the audio URL
+        let resolvedVideoId = videoId;
+        
+        // If we only have the URL, extract the video ID
+        if (!resolvedVideoId && videoUrl) {
+            // Extract video ID from URL
+            const watchRegex = /youtube\.com\/watch\?v=([^&]+)/;
+            const shortRegex = /youtu\.be\/([^?&]+)/;
+            const vRegex = /youtube\.com\/v\/([^?&]+)/;
+            const embedRegex = /youtube\.com\/embed\/([^?&]+)/;
+            
+            const watchMatch = videoUrl.match(watchRegex);
+            const shortMatch = videoUrl.match(shortRegex);
+            const vMatch = videoUrl.match(vRegex);
+            const embedMatch = videoUrl.match(embedRegex);
+            
+            if (watchMatch) resolvedVideoId = watchMatch[1];
+            else if (shortMatch) resolvedVideoId = shortMatch[1];
+            else if (vMatch) resolvedVideoId = vMatch[1];
+            else if (embedMatch) resolvedVideoId = embedMatch[1];
+            
+            if (!resolvedVideoId) {
+                throw new Error('לא ניתן לחלץ מזהה סרטון מה-URL שסופק');
+            }
+        }
+        
+        // Get video info using our existing endpoint
+        console.log(`[${requestId}] Fetching video info for ID: ${resolvedVideoId}`);
+        const infoUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/youtube-info?id=${resolvedVideoId}`;
+        const infoResponse = await fetch(infoUrl);
+        
+        if (!infoResponse.ok) {
+            const errorText = await infoResponse.text();
+            throw new Error(`שגיאה בקבלת מידע על הסרטון: ${infoResponse.status}. ${errorText}`);
+        }
+        
+        const infoData = await infoResponse.json();
+        
+        if (!infoData.success || !infoData.data) {
+            throw new Error('תגובה לא תקפה מנקודת הקצה של מידע הסרטון');
+        }
+        
+        // Step 2: Find the best audio URL
+        let audioUrl = null;
+        
+        // First try to get the audio-only format for best efficiency
+        if (infoData.data.recommended && infoData.data.recommended.audio && infoData.data.recommended.audio.url) {
+            audioUrl = infoData.data.recommended.audio.url;
+            console.log(`[${requestId}] Using recommended audio-only format`);
+        } 
+        // If no audio-only format, try alternative audio formats
+        else if (infoData.data.formats && infoData.data.formats.audio && infoData.data.formats.audio.length > 0) {
+            audioUrl = infoData.data.formats.audio[0].url;
+            console.log(`[${requestId}] Using alternative audio format`);
+        }
+        // If no audio formats at all, try combined/video format
+        else if (infoData.data.recommended && infoData.data.recommended.combined && infoData.data.recommended.combined.url) {
+            audioUrl = infoData.data.recommended.combined.url;
+            console.log(`[${requestId}] Using combined video/audio format (no audio-only available)`);
+        } else {
+            throw new Error('לא נמצא פורמט אודיו זמין לסרטון זה');
+        }
+        
+        if (!audioUrl) {
+            throw new Error('לא ניתן למצוא כתובת URL לאודיו של הסרטון');
+        }
+        
+        // Step 3: Download the audio file to a temporary location on the server
+        console.log(`[${requestId}] Downloading audio file...`);
+        
+        // Use our proxy to download the file (avoid CORS/YouTube restrictions)
+        const proxyUrl = `http${req.secure ? 's' : ''}://${req.headers.host}/proxy?url=${encodeURIComponent(audioUrl)}`;
+        
+        // Prepare a filename for the temporary audio file
+        const tempAudioPath = path.join(TEMP_DIR, `${resolvedVideoId}_${Date.now()}.mp3`);
+        
+        // Download the file using our existing proxy
+        const audioResponse = await fetch(proxyUrl);
+        
+        if (!audioResponse.ok) {
+            throw new Error(`שגיאה בהורדת קובץ האודיו: ${audioResponse.status} ${audioResponse.statusText}`);
+        }
+        
+        // Save the audio response to the temp file
+        const audioBuffer = await audioResponse.arrayBuffer();
+        fs.writeFileSync(tempAudioPath, Buffer.from(audioBuffer));
+        
+        console.log(`[${requestId}] Audio file downloaded and saved to: ${tempAudioPath}`);
+        
+        // Step 4: Send the audio file to ElevenLabs for transcription
+        console.log(`[${requestId}] Sending audio to ElevenLabs for transcription...`);
+        
+        const formData = new FormData();
+        const audioFileBuffer = fs.readFileSync(tempAudioPath);
+        const audioBlob = new Blob([audioFileBuffer]);
+        
+        formData.append('file', audioBlob, `${resolvedVideoId}.mp3`);
+        formData.append('model_id', 'scribe_v1');
+        formData.append('timestamps_granularity', 'word');
+        formData.append('language', ''); // Auto-detect language
+        
+        const elevenLabsUrl = 'https://api.elevenlabs.io/v1/speech-to-text';
+        const elevenLabsOptions = {
+            method: 'POST',
+            headers: { 
+                'xi-api-key': ELEVENLABS_API_KEY
+            },
+            body: formData
+        };
+        
+        // Try ElevenLabs API with retries
+        let transcriptionResponse;
+        let apiRetries = 2; // Fewer retries for API to avoid excessive costs
+        let apiDelay = 2000; // Start with 2 seconds
+        let apiSuccess = false;
+        
+        for (let attempt = 1; attempt <= apiRetries + 1; attempt++) {
+            try {
+                console.log(`[${requestId}] ElevenLabs API attempt ${attempt}/${apiRetries + 1}`);
+                transcriptionResponse = await fetch(elevenLabsUrl, elevenLabsOptions);
+                
+                if (!transcriptionResponse.ok) {
+                    let errorBody = await transcriptionResponse.text();
+                    try { 
+                        errorBody = JSON.stringify(JSON.parse(errorBody), null, 2); 
+                    } catch (e) { 
+                        /* Ignore parsing error */ 
+                    }
+                    
+                    console.error(`[${requestId}] ElevenLabs API Error Response (${transcriptionResponse.status}):`, errorBody);
+                    throw new Error(`שגיאת API מ-ElevenLabs: ${transcriptionResponse.status} ${transcriptionResponse.statusText}`);
+                }
+                
+                apiSuccess = true;
+                break; // Exit loop on success
+            } catch (apiError) {
+                console.warn(`[${requestId}] ElevenLabs API attempt ${attempt} failed:`, apiError);
+                
+                if (attempt <= apiRetries) {
+                    console.log(`[${requestId}] Waiting ${apiDelay}ms before API retry...`);
+                    await new Promise(resolve => setTimeout(resolve, apiDelay));
+                    apiDelay *= 2; // Exponential backoff
+                } else {
+                    // Last attempt failed, clean up and rethrow
+                    cleanupTempFile(tempAudioPath);
+                    throw apiError;
+                }
+            }
+        }
+        
+        if (!apiSuccess) {
+            cleanupTempFile(tempAudioPath);
+            throw new Error("כל נסיונות התמלול ל-ElevenLabs נכשלו");
+        }
+        
+        // Step 5: Process the transcription response
+        console.log(`[${requestId}] Processing transcription response...`);
+        const transcriptionData = await transcriptionResponse.json();
+        
+        // Clean up the temporary audio file
+        cleanupTempFile(tempAudioPath);
+        
+        if (!transcriptionData.words || !Array.isArray(transcriptionData.words)) {
+            throw new Error("התקבלו נתוני תמלול לא תקינים מ-ElevenLabs");
+        }
+        
+        // Step 6: Convert results to requested format(s)
+        console.log(`[${requestId}] Converting results to requested format: ${format}`);
+        
+        // Create the SRT version
+        const srtContent = convertWordsToSrt(transcriptionData.words);
+        
+        // Create the plain text version
+        const textContent = convertWordsToPlainText(transcriptionData.words);
+        
+        // Prepare the JSON version (full ElevenLabs response)
+        const jsonContent = {
+            metadata: {
+                title: infoData.data.title || `YouTube Video ${resolvedVideoId}`,
+                videoId: resolvedVideoId,
+                duration: infoData.data.duration || 0,
+                language: transcriptionData.language || 'unknown',
+                timestamp: new Date().toISOString()
+            },
+            transcript: {
+                text: textContent,
+                words: transcriptionData.words
+            }
+        };
+        
+        // Step 7: Return results based on requested format
+        if (format === 'json') {
+            res.json({
+                success: true,
+                data: jsonContent
+            });
+        } else if (format === 'srt') {
+            res.setHeader('Content-Type', 'text/plain; charset=UTF-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${resolvedVideoId}_transcript.srt"`);
+            res.send(srtContent);
+        } else if (format === 'txt') {
+            res.setHeader('Content-Type', 'text/plain; charset=UTF-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${resolvedVideoId}_transcript.txt"`);
+            res.send(textContent);
+        } else {
+            // Default: return all formats
+            res.json({
+                success: true,
+                data: {
+                    metadata: jsonContent.metadata,
+                    formats: {
+                        json: jsonContent,
+                        srt: srtContent,
+                        txt: textContent
+                    }
+                }
+            });
+        }
+        
+        console.log(`[${requestId}] Transcription process completed successfully`);
+        
+    } catch (error) {
+        console.error(`[${requestId}] Transcription error:`, error);
+        
+        res.status(500).json({
+            success: false,
+            error: `שגיאה בתהליך התמלול: ${error.message}`
+        });
+    }
+});
+
+// Helper function to clean up temporary files
+function cleanupTempFile(filePath) {
+    try {
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log(`Deleted temporary file: ${filePath}`);
+        }
+    } catch (error) {
+        console.error(`Error deleting temporary file ${filePath}:`, error);
+    }
+}
 
 app.listen(PORT, () => {
     console.log(`Proxy server listening on port ${PORT}`);
