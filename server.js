@@ -86,7 +86,9 @@ async function fetchFromYouTube(url, options, maxRetries = 3) {
             ...options.headers,
             'Referer': 'https://www.youtube.com/',
             'Origin': 'https://www.youtube.com'
-        }
+        },
+        // Set a timeout of 15 seconds for the fetch operation
+        timeout: 15000 // 15 second timeout before aborting
     };
 
     let lastError;
@@ -148,17 +150,85 @@ async function fetchFromYouTube(url, options, maxRetries = 3) {
     throw lastError || new Error('Failed to fetch from YouTube after multiple attempts');
 }
 
+// Add maximum file size check for streaming
+const MAX_FILE_SIZE = 25 * 1024 * 1024; // Limit to 25MB for Render free tier
+let totalBytesStreamed = 0;
+
+// Modify the proxy endpoint to include size limits and better streaming
 app.get('/proxy', async (req, res) => {
     const videoUrl = req.query.url;
     const userAgent = req.headers['user-agent'] || 'Mozilla/5.0';
+    const startTime = Date.now();
 
     if (!videoUrl) {
         return res.status(400).json({ error: 'Missing url parameter' });
     }
+    
+    // Check if this is a YouTube website URL rather than a media/CDN URL
+    if (videoUrl.includes('youtube.com/watch') || 
+        videoUrl.includes('youtu.be/') || 
+        videoUrl.match(/youtube\.com\/(shorts|playlist|channel|c\/)/)) {
+        
+        console.log(`Redirecting user to YouTube URL: ${videoUrl}`);
+        return res.redirect(302, videoUrl);
+    }
+
+    // Add support for partial content requests (Range header)
+    const rangeHeader = req.headers.range;
+    let rangeStart = 0;
+    let rangeEnd = null;
+
+    if (rangeHeader) {
+        const rangeParts = rangeHeader.replace('bytes=', '').split('-');
+        rangeStart = parseInt(rangeParts[0], 10) || 0;
+        if (rangeParts[1] && rangeParts[1].trim() !== '') {
+            rangeEnd = parseInt(rangeParts[1], 10);
+        }
+    }
+
+    // Reset byte counter for this request
+    totalBytesStreamed = 0;
 
     // Add request ID for tracking
     const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
     console.log(`[${requestId}] Processing request for: ${videoUrl.substring(0, 100)}...`);
+
+    // Set up keepalive checker for the client connection
+    const keepAliveInterval = setInterval(() => {
+        if (!res.writableEnded) {
+            // If connection is still open but taking long, write a comment to keep it alive
+            try {
+                res.write('\n');
+            } catch (err) {
+                // If we can't write, the connection is probably already closed
+                clearInterval(keepAliveInterval);
+            }
+        } else {
+            clearInterval(keepAliveInterval);
+        }
+    }, 10000); // Check every 10 seconds
+
+    // Set a timeout for the entire request
+    const requestTimeout = setTimeout(() => {
+        if (!res.writableEnded) {
+            console.error(`[${requestId}] Request timed out after 120 seconds`);
+            clearInterval(keepAliveInterval);
+            
+            // Only attempt to write an error if headers haven't been sent
+            if (!res.headersSent) {
+                return res.status(504).json({ 
+                    error: 'Gateway Timeout', 
+                    message: 'Request took too long to complete'
+                });
+            } else {
+                try {
+                    res.end();
+                } catch (e) {
+                    console.error(`[${requestId}] Error ending response after timeout:`, e);
+                }
+            }
+        }
+    }, 120000); // 120 second overall timeout
 
     try {
         // Check if it's a YouTube URL
@@ -168,19 +238,24 @@ app.get('/proxy', async (req, res) => {
         
         console.log(`[${requestId}] URL identified as ${isYouTubeUrl ? 'YouTube' : 'generic'} URL`);
         
-        // Log more details about the request
-        console.log(`[${requestId}] Request headers:`, JSON.stringify(req.headers, null, 2));
-        
+        // Modify fetch options to include range if requested
         const fetchOptions = {
             headers: {
                 'User-Agent': userAgent,
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity',  // Important for YouTube
                 'Connection': 'keep-alive',
-                'Range': 'bytes=0-', // Support range requests
                 'Referer': 'https://www.youtube.com/' // Try adding referer
             }
         };
+
+        // Add range header if present in original request
+        if (rangeHeader) {
+            fetchOptions.headers['Range'] = rangeHeader;
+        } else {
+            // Default to start from beginning
+            fetchOptions.headers['Range'] = 'bytes=0-';
+        }
         
         console.log(`[${requestId}] Fetch options:`, JSON.stringify(fetchOptions, null, 2));
         
@@ -189,9 +264,28 @@ app.get('/proxy', async (req, res) => {
             ? await fetchFromYouTube(videoUrl, fetchOptions)
             : await fetchWithRetries(videoUrl, fetchOptions);
 
-        // Log response details before piping
+        // Log response details
         console.log(`[${requestId}] Response status: ${response.status}`);
-        console.log(`[${requestId}] Response headers:`, JSON.stringify(Object.fromEntries([...response.headers.entries()]), null, 2));
+        
+        // Check for content length
+        const contentLength = response.headers.get('content-length');
+        const estimatedSize = contentLength ? parseInt(contentLength, 10) : null;
+        
+        if (estimatedSize && estimatedSize > MAX_FILE_SIZE) {
+            console.warn(`[${requestId}] Content length (${estimatedSize} bytes) exceeds maximum size limit (${MAX_FILE_SIZE} bytes)`);
+            clearInterval(keepAliveInterval);
+            clearTimeout(requestTimeout);
+            return res.status(413).json({
+                error: 'Payload Too Large',
+                message: `File size (${Math.round(estimatedSize/1024/1024)}MB) exceeds maximum size limit (${Math.round(MAX_FILE_SIZE/1024/1024)}MB)`,
+                solution: 'Try a different quality or format'
+            });
+        }
+        
+        // Set proper status code for range requests
+        if (rangeHeader && response.status === 206) {
+            res.status(206);
+        }
 
         // Copy all response headers to our response
         for (const [key, value] of response.headers.entries()) {
@@ -214,44 +308,104 @@ app.get('/proxy', async (req, res) => {
             res.setHeader('Content-Type', 'application/octet-stream');
         }
         
-        // Optional: support partial content for larger files
-        res.setHeader('Accept-Ranges', 'bytes');
-        
-        // Handle streaming with explicit error handling
+        // Handle streaming with explicit error handling and size limits
         try {
-            // Pipe the response body to the client
-            response.body.pipe(res);
-            
-            // Handle stream errors
-            response.body.on('error', (streamErr) => {
-                console.error('Stream error:', streamErr);
-                // At this point headers are already sent, so we can only close the connection
-                try {
-                    res.end();
-                } catch (e) {
-                    console.error('Error while ending response after stream error:', e);
+            // Create a transform stream that monitors size
+            const { Transform } = require('stream');
+            const sizeMonitorStream = new Transform({
+                transform(chunk, encoding, callback) {
+                    totalBytesStreamed += chunk.length;
+                    
+                    if (totalBytesStreamed > MAX_FILE_SIZE) {
+                        console.warn(`[${requestId}] Size limit exceeded during streaming. Closing connection after ${totalBytesStreamed} bytes`);
+                        this.destroy(new Error(`Size limit of ${MAX_FILE_SIZE} bytes exceeded`));
+                        return;
+                    }
+                    
+                    // Pass the chunk through
+                    this.push(chunk);
+                    callback();
                 }
             });
             
-            // Log when the stream is done
-            response.body.on('end', () => {
-                console.log('Stream completed successfully');
+            // Handle errors on the size monitor stream
+            sizeMonitorStream.on('error', (err) => {
+                console.error(`[${requestId}] Size monitor stream error:`, err);
+                if (!res.writableEnded) {
+                    try {
+                        res.end();
+                    } catch (e) {
+                        console.error(`[${requestId}] Error ending response after size monitor error:`, e);
+                    }
+                }
             });
             
-            // Log success with limited URL (for privacy/security)
+            // Handle errors on the source body stream
+            response.body.on('error', (err) => {
+                console.error(`[${requestId}] Source stream error:`, err);
+                clearInterval(keepAliveInterval);
+                clearTimeout(requestTimeout);
+                
+                if (!res.writableEnded) {
+                    try {
+                        res.end();
+                    } catch (e) {
+                        console.error(`[${requestId}] Error ending response after source error:`, e);
+                    }
+                }
+            });
+            
+            // Handle end of stream
+            response.body.on('end', () => {
+                console.log(`[${requestId}] Stream completed successfully. Total bytes: ${totalBytesStreamed}`);
+                clearInterval(keepAliveInterval);
+                clearTimeout(requestTimeout);
+            });
+            
+            // Pipe through the monitor and to the response
+            response.body
+                .pipe(sizeMonitorStream)
+                .pipe(res)
+                .on('finish', () => {
+                    const duration = Date.now() - startTime;
+                    console.log(`[${requestId}] Response finished in ${duration}ms. Total bytes: ${totalBytesStreamed}`);
+                    clearInterval(keepAliveInterval);
+                    clearTimeout(requestTimeout);
+                })
+                .on('error', (err) => {
+                    console.error(`[${requestId}] Response stream error:`, err);
+                    clearInterval(keepAliveInterval);
+                    clearTimeout(requestTimeout);
+                });
+                
+            // Log success with limited URL
             const urlPreview = videoUrl.length > 60 ? 
                 `${videoUrl.substring(0, 30)}...${videoUrl.substring(videoUrl.length - 30)}` : 
                 videoUrl;
             console.log(`[${requestId}] Successfully piping response for: ${urlPreview}`);
+            
         } catch (streamSetupErr) {
-            console.error('Error setting up stream:', streamSetupErr);
+            console.error(`[${requestId}] Error setting up stream:`, streamSetupErr);
+            clearInterval(keepAliveInterval);
+            clearTimeout(requestTimeout);
+            
             // Only send error if headers have not been sent
             if (!res.headersSent) {
                 return res.status(500).json({ error: `Stream setup error: ${streamSetupErr.message}` });
+            } else if (!res.writableEnded) {
+                try {
+                    res.end();
+                } catch (e) {
+                    console.error(`[${requestId}] Error ending response after stream setup error:`, e);
+                }
             }
         }
         
     } catch (err) {
+        // Clean up intervals/timeouts on error
+        clearInterval(keepAliveInterval);
+        clearTimeout(requestTimeout);
+        
         console.error(`[${requestId}] Proxy error:`, err);
         console.error(`[${requestId}] Error stack:`, err.stack);
         
